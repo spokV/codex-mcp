@@ -45,24 +45,29 @@ def clean_codex_output(raw_output: str, original_prompt: str = "") -> str:
 
     # Remove the exact prompt template if it appears at the start of output
     # This is more conservative and only removes the template we injected
+    prompt_was_removed = False
     if original_prompt and cleaned.startswith(original_prompt):
         cleaned = cleaned[len(original_prompt):].lstrip()
+        prompt_was_removed = True
 
-    # Remove common prompt template patterns only at the very start of output
-    # Use \A to anchor to absolute start, not ^ which matches line starts with MULTILINE
-    patterns_to_remove = [
-        # Remove "Review the following files: X" followed by newlines at start only
-        r"\AReview the following files:.*?\n+",
-        # Remove "Review the code in this directory" at absolute start only
-        r"\AReview the code in this directory\.?\n+",
-        # Remove "Review type:" line only at absolute start
-        r"\AReview type:.*?\n+",
-        # Remove "Context:" line only at absolute start
-        r"\AContext:.*?\n+",
-    ]
+    # Only apply pattern-based cleaning if we didn't already remove the exact prompt
+    # This prevents accidentally removing legitimate Codex responses that happen to
+    # start with these phrases
+    if not prompt_was_removed:
+        # Remove common prompt template patterns only at the very start of output
+        # Use \A to anchor to absolute start, not ^ which matches line starts with MULTILINE
+        # These patterns match the structure of prompts we generate, not arbitrary text
+        patterns_to_remove = [
+            # Remove "Review the following files: X\n\nReview type: Y\n\n" at start only
+            r"\AReview the following files:.*?\n+Review type:.*?\n+",
+            # Remove "Review the code in this directory.\n\nReview type: Y\n\n" at start only
+            r"\AReview the code in this directory\.?\n+Review type:.*?\n+",
+            # Standalone review type at very start (fallback)
+            r"\AReview type:.*?\n+",
+        ]
 
-    for pattern in patterns_to_remove:
-        cleaned = re.sub(pattern, "", cleaned, count=1)
+        for pattern in patterns_to_remove:
+            cleaned = re.sub(pattern, "", cleaned, count=1)
 
     # Remove extra blank lines (3+ consecutive newlines)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
@@ -146,9 +151,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         )
 
     elif name == "execute_codex_command":
+        # Normalize args to empty list if None to prevent concatenation errors
+        args = arguments.get("args") or []
         return await execute_codex_command(
             arguments.get("command"),
-            arguments.get("args", [])
+            args
         )
 
     else:
@@ -165,57 +172,29 @@ async def review_plan(plan: str, context: str, review_type: str,
     using its built-in file reading capabilities instead of receiving code inline.
     """
 
-    # Construct the review prompt
+    # Construct the review prompt - keep it concise for faster responses
     if working_directory and files:
         # Ask Codex to review specific files in the working directory
         files_list = ", ".join(files)
-        review_prompt = f"""Review the following files: {files_list}
-
-Review type: {review_type}
+        review_prompt = f"""{review_type.capitalize()} review of {files_list}:
 
 {plan}
 
-{f"Context: {context}" if context else ""}
-
-Please provide:
-1. Overall assessment (approve/needs changes/reject)
-2. Specific issues or concerns
-3. Suggestions for improvement
-4. Any risks or considerations
-
-Format your response as structured feedback."""
+{f"Context: {context}" if context else ""}"""
     elif working_directory:
         # Ask Codex to review the working directory
-        review_prompt = f"""Review the code in this directory.
-
-Review type: {review_type}
+        review_prompt = f"""{review_type.capitalize()} review:
 
 {plan}
 
-{f"Context: {context}" if context else ""}
-
-Please provide:
-1. Overall assessment (approve/needs changes/reject)
-2. Specific issues or concerns
-3. Suggestions for improvement
-4. Any risks or considerations
-
-Format your response as structured feedback."""
+{f"Context: {context}" if context else ""}"""
     else:
         # Traditional inline review
-        review_prompt = f"""Review the following {review_type}:
+        review_prompt = f"""{review_type.capitalize()} review:
 
 {plan}
 
-{f"Context: {context}" if context else ""}
-
-Please provide:
-1. Overall assessment (approve/needs changes/reject)
-2. Specific issues or concerns
-3. Suggestions for improvement
-4. Any risks or considerations
-
-Format your response as structured feedback."""
+{f"Context: {context}" if context else ""}"""
 
     # Validate inputs
     if not plan or not plan.strip():
@@ -241,16 +220,16 @@ Format your response as structured feedback."""
             # Use full-auto for safer automated execution
             cmd.append("--full-auto")
 
-        if working_directory:
-            cmd.extend(["-C", working_directory])
-
         cmd.append(review_prompt)
 
         # Execute Codex CLI using async subprocess for non-blocking execution
+        # Use cwd instead of -C flag to avoid subprocess hanging issues
         process = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,  # Prevent hanging on stdin
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_directory if working_directory else None
         )
 
         try:
@@ -277,9 +256,17 @@ Format your response as structured feedback."""
                 text=f"Codex CLI Review Results:\n\n{cleaned_output}"
             )]
         else:
+            # Include both stdout and stderr for better diagnostics
+            error_output = []
+            if stdout_text.strip():
+                error_output.append(f"stdout:\n{stdout_text}")
+            if stderr_text.strip():
+                error_output.append(f"stderr:\n{stderr_text}")
+
+            combined_error = "\n\n".join(error_output) if error_output else "No output"
             return [TextContent(
                 type="text",
-                text=f"Codex CLI returned an error:\n{stderr_text}"
+                text=f"Codex CLI returned an error (exit code {process.returncode}):\n\n{combined_error}"
             )]
 
     except FileNotFoundError:
@@ -315,6 +302,9 @@ async def execute_codex_command(command: str, args: list[str]) -> list[TextConte
         is_prompt = False
         prompt_text = ""
 
+        # Normalize args to empty list if None to prevent concatenation errors
+        args = list(args or [])
+
         # If command looks like a subcommand, use it as such; otherwise treat as a prompt
         if command in ["exec", "login", "logout", "mcp", "mcp-server", "app-server",
                        "completion", "sandbox", "apply", "resume", "cloud", "features"]:
@@ -342,6 +332,7 @@ async def execute_codex_command(command: str, args: list[str]) -> list[TextConte
         # Execute Codex CLI using async subprocess for non-blocking execution
         process = await asyncio.create_subprocess_exec(
             *full_command,
+            stdin=asyncio.subprocess.DEVNULL,  # Prevent hanging on stdin
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -376,9 +367,17 @@ async def execute_codex_command(command: str, args: list[str]) -> list[TextConte
                     text=f"Codex CLI Output:\n\n{stdout_text}"
                 )]
         else:
+            # Include both stdout and stderr for better diagnostics
+            error_output = []
+            if stdout_text.strip():
+                error_output.append(f"stdout:\n{stdout_text}")
+            if stderr_text.strip():
+                error_output.append(f"stderr:\n{stderr_text}")
+
+            combined_error = "\n\n".join(error_output) if error_output else "No output"
             return [TextContent(
                 type="text",
-                text=f"Codex CLI Error:\n{stderr_text}"
+                text=f"Codex CLI Error (exit code {process.returncode}):\n\n{combined_error}"
             )]
 
     except FileNotFoundError:
