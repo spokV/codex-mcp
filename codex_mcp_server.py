@@ -388,7 +388,7 @@ async def execute_codex_command(command: str, args: list[str]) -> list[TextConte
             )]
 
     except FileNotFoundError as e:
-        # Distinguish between command not found and invalid working directory
+        # Distinguish between command not found and invalid path
         # If filename matches the command we're trying to run, it's a command-not-found error
         if e.filename == "codex":
             return [TextContent(
@@ -396,10 +396,10 @@ async def execute_codex_command(command: str, args: list[str]) -> list[TextConte
                 text="Error: 'codex' command not found. Please ensure Codex CLI is installed and in your PATH."
             )]
         else:
-            # Otherwise it's likely an invalid working directory
+            # Otherwise it's likely an invalid path
             return [TextContent(
                 type="text",
-                text=f"Error: Path not found or inaccessible: {e.filename or working_directory or 'unknown'}"
+                text=f"Error: Path not found or inaccessible: {e.filename or 'unknown'}"
             )]
     except Exception as e:
         return [TextContent(

@@ -14,7 +14,8 @@ Take the user's question or request and send it directly to Codex CLI using the 
 **Instructions**:
 1. Take the user's question/request
 2. Send it to Codex CLI using the review_plan tool
-3. Return Codex's response to the user
+3. Display Codex's response directly without additional formatting or wrapping
+4. Keep your own commentary minimal - let Codex's response speak for itself
 
 **For code reviews**:
 If the user wants to review specific files, use the `working_directory` and `files` parameters to let Codex read the code directly:
