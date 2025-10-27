@@ -62,8 +62,6 @@ def clean_codex_output(raw_output: str, original_prompt: str = "") -> str:
             r"\AReview the following files:.*?\n+Review type:.*?\n+",
             # Remove "Review the code in this directory.\n\nReview type: Y\n\n" at start only
             r"\AReview the code in this directory\.?\n+Review type:.*?\n+",
-            # Standalone review type at very start (fallback)
-            r"\AReview type:.*?\n+",
         ]
 
         for pattern in patterns_to_remove:
@@ -235,14 +233,14 @@ async def review_plan(plan: str, context: str, review_type: str,
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=120  # Increased timeout for complex reviews
+                timeout=300  # 5 minutes for complex file reviews
             )
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
             return [TextContent(
                 type="text",
-                text="Codex CLI review timed out after 120 seconds"
+                text="Codex CLI review timed out after 300 seconds"
             )]
 
         stdout_text = stdout.decode('utf-8') if stdout else ""
@@ -269,11 +267,20 @@ async def review_plan(plan: str, context: str, review_type: str,
                 text=f"Codex CLI returned an error (exit code {process.returncode}):\n\n{combined_error}"
             )]
 
-    except FileNotFoundError:
-        return [TextContent(
-            type="text",
-            text="Error: 'codex' command not found. Please ensure Codex CLI is installed and in your PATH."
-        )]
+    except FileNotFoundError as e:
+        # Distinguish between command not found and invalid working directory
+        # If filename matches the command we're trying to run, it's a command-not-found error
+        if e.filename == "codex":
+            return [TextContent(
+                type="text",
+                text="Error: 'codex' command not found. Please ensure Codex CLI is installed and in your PATH."
+            )]
+        else:
+            # Otherwise it's likely an invalid working directory
+            return [TextContent(
+                type="text",
+                text=f"Error: Path not found or inaccessible: {e.filename or working_directory or 'unknown'}"
+            )]
     except Exception as e:
         return [TextContent(
             type="text",
@@ -340,14 +347,14 @@ async def execute_codex_command(command: str, args: list[str]) -> list[TextConte
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=120  # Increased timeout
+                timeout=300  # 5 minutes for complex operations
             )
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
             return [TextContent(
                 type="text",
-                text="Codex CLI command timed out after 120 seconds"
+                text="Codex CLI command timed out after 300 seconds"
             )]
 
         stdout_text = stdout.decode('utf-8') if stdout else ""
@@ -380,11 +387,20 @@ async def execute_codex_command(command: str, args: list[str]) -> list[TextConte
                 text=f"Codex CLI Error (exit code {process.returncode}):\n\n{combined_error}"
             )]
 
-    except FileNotFoundError:
-        return [TextContent(
-            type="text",
-            text="Error: 'codex' command not found. Please ensure Codex CLI is installed and in your PATH."
-        )]
+    except FileNotFoundError as e:
+        # Distinguish between command not found and invalid working directory
+        # If filename matches the command we're trying to run, it's a command-not-found error
+        if e.filename == "codex":
+            return [TextContent(
+                type="text",
+                text="Error: 'codex' command not found. Please ensure Codex CLI is installed and in your PATH."
+            )]
+        else:
+            # Otherwise it's likely an invalid working directory
+            return [TextContent(
+                type="text",
+                text=f"Error: Path not found or inaccessible: {e.filename or working_directory or 'unknown'}"
+            )]
     except Exception as e:
         return [TextContent(
             type="text",
