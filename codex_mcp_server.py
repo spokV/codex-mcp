@@ -5,14 +5,13 @@ Allows Claude Code to send plans to Codex CLI for review
 """
 
 import asyncio
-import json
 import os
 import re
 import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.session import ServerSession
@@ -47,6 +46,58 @@ class Task:
 
 # Global task storage
 tasks: dict[str, Task] = {}
+
+
+def _task_display_name(task: Task) -> str:
+    if task.command == "review":
+        return "Codex review"
+    if isinstance(task.args, dict):
+        cmd = task.args.get("command")
+        if cmd:
+            return f"Codex command '{cmd}'"
+    return "Codex task"
+
+
+def _summarize_error(message: Optional[str], limit: int = 200) -> str:
+    if not message:
+        return "See get_task_result for details."
+    cleaned = message.strip().splitlines()[0]
+    if len(cleaned) > limit:
+        return cleaned[:limit - 3] + "..."
+    return cleaned
+
+
+async def _send_context_message(task: Task, level: str, message: str):
+    if not task.context:
+        return
+
+    handler = getattr(task.context, level, None)
+    if not callable(handler):
+        handler = task.context.info
+
+    try:
+        await asyncio.shield(handler(message))
+    except Exception as e:
+        print(f"[ERROR] Failed to send {level} notification: {e}", file=sys.stderr, flush=True)
+
+
+async def _emit_task_notification(task: Task):
+    if not task.context:
+        return
+
+    prefix = "[codex-async]"
+    label = _task_display_name(task)
+
+    if task.status == "completed":
+        message = f"{prefix} {label} finished (task {task.task_id}). Run get_task_result to view the Codex output."
+        await _send_context_message(task, "info", message)
+    elif task.status == "failed":
+        summary = _summarize_error(task.error)
+        message = f"{prefix} {label} failed (task {task.task_id}). {summary}"
+        await _send_context_message(task, "error", message)
+    elif task.status == "cancelled":
+        message = f"{prefix} {label} was cancelled (task {task.task_id})."
+        await _send_context_message(task, "warning", message)
 
 
 async def cleanup_old_tasks():
@@ -90,28 +141,9 @@ def clean_codex_output(raw_output: str, original_prompt: str = "") -> str:
     cleaned = raw_output
 
     # Remove the exact prompt template if it appears at the start of output
-    # This is more conservative and only removes the template we injected
-    prompt_was_removed = False
+    # Only remove exact matches to avoid accidentally stripping valid responses
     if original_prompt and cleaned.startswith(original_prompt):
         cleaned = cleaned[len(original_prompt):].lstrip()
-        prompt_was_removed = True
-
-    # Only apply pattern-based cleaning if we didn't already remove the exact prompt
-    # This prevents accidentally removing legitimate Codex responses that happen to
-    # start with these phrases
-    if not prompt_was_removed:
-        # Remove common prompt template patterns only at the very start of output
-        # Use \A to anchor to absolute start, not ^ which matches line starts with MULTILINE
-        # These patterns match the structure of prompts we generate, not arbitrary text
-        patterns_to_remove = [
-            # Remove "Review the following files: X\n\nReview type: Y\n\n" at start only
-            r"\AReview the following files:.*?\n+Review type:.*?\n+",
-            # Remove "Review the code in this directory.\n\nReview type: Y\n\n" at start only
-            r"\AReview the code in this directory\.?\n+Review type:.*?\n+",
-        ]
-
-        for pattern in patterns_to_remove:
-            cleaned = re.sub(pattern, "", cleaned, count=1)
 
     # Remove extra blank lines (3+ consecutive newlines)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
@@ -153,7 +185,7 @@ async def _run_codex_review(task_id: str, plan: str, context: str, review_type: 
 
 {f"Context: {context}" if context else ""}"""
 
-        # Build command
+        # Build command (without prompt to avoid ARG_MAX)
         cmd = ["codex", "exec", "--skip-git-repo-check"]
 
         if BYPASS_APPROVALS:
@@ -161,12 +193,12 @@ async def _run_codex_review(task_id: str, plan: str, context: str, review_type: 
         else:
             cmd.append("--full-auto")
 
-        cmd.append(review_prompt)
+        cmd.append("-")  # Read from stdin
 
-        # Execute Codex CLI
+        # Execute Codex CLI with prompt via stdin
         process = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=working_directory if working_directory else None
@@ -176,7 +208,7 @@ async def _run_codex_review(task_id: str, plan: str, context: str, review_type: 
 
         try:
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
+                process.communicate(input=review_prompt.encode('utf-8')),
                 timeout=300
             )
         except asyncio.TimeoutError:
@@ -185,6 +217,7 @@ async def _run_codex_review(task_id: str, plan: str, context: str, review_type: 
             task.status = "failed"
             task.error = "Codex CLI review timed out after 300 seconds"
             task.completion_time = datetime.now()
+            await _emit_task_notification(task)
             return
 
         stdout_text = stdout.decode('utf-8') if stdout else ""
@@ -195,13 +228,8 @@ async def _run_codex_review(task_id: str, plan: str, context: str, review_type: 
             task.status = "completed"
             task.result = f"Codex CLI Review Results:\n\n{cleaned_output}"
             task.completion_time = datetime.now()
+            await _emit_task_notification(task)
 
-            # Send MCP notification via context
-            if task.context:
-                try:
-                    await task.context.info(f"Codex review task {task_id} completed successfully")
-                except Exception as e:
-                    print(f"[ERROR] Failed to send notification: {e}", file=sys.stderr, flush=True)
         else:
             error_output = []
             if stdout_text.strip():
@@ -213,6 +241,7 @@ async def _run_codex_review(task_id: str, plan: str, context: str, review_type: 
             task.status = "failed"
             task.error = f"Codex CLI returned an error (exit code {process.returncode}):\n\n{combined_error}"
             task.completion_time = datetime.now()
+            await _emit_task_notification(task)
 
     except asyncio.CancelledError:
         # Task was cancelled
@@ -224,6 +253,7 @@ async def _run_codex_review(task_id: str, plan: str, context: str, review_type: 
                 await task.process.wait()
             except:
                 pass
+        await _emit_task_notification(task)
         raise
 
     except FileNotFoundError as e:
@@ -233,11 +263,13 @@ async def _run_codex_review(task_id: str, plan: str, context: str, review_type: 
             task.error = f"Error: Path not found or inaccessible: {e.filename or working_directory or 'unknown'}"
         task.status = "failed"
         task.completion_time = datetime.now()
+        await _emit_task_notification(task)
 
     except Exception as e:
         task.status = "failed"
         task.error = f"Error executing Codex CLI: {str(e)}"
         task.completion_time = datetime.now()
+        await _emit_task_notification(task)
 
 
 @mcp.tool()
@@ -309,14 +341,43 @@ async def _run_codex_command(task_id: str, command: str, args: list[str]):
         # Normalize args
         args = list(args or [])
 
+        if args and not BYPASS_APPROVALS:
+            # Reject attempts to inject bypass flags when approvals must remain enforced
+            blocked_flag_names = {"--dangerously-bypass-approvals-and-sandbox"}
+            sanitized_args: list[str] = []
+            rejected_args: list[str] = []
+
+            for arg in args:
+                flag_name = arg.split("=", 1)[0]
+                if flag_name in blocked_flag_names:
+                    rejected_args.append(arg)
+                else:
+                    sanitized_args.append(arg)
+
+            if rejected_args:
+                task.status = "failed"
+                task.error = (
+                    "Security restriction: the following flags are not permitted when "
+                    "CODEX_BYPASS_APPROVALS is disabled: " + ", ".join(rejected_args)
+                )
+                task.completion_time = datetime.now()
+                await _emit_task_notification(task)
+                return
+
+            args = sanitized_args
+
         # Build command
-        if command in ["exec", "login", "logout", "mcp", "mcp-server", "app-server",
-                       "completion", "sandbox", "apply", "resume", "cloud", "features"]:
+        stdin_input = None
+        # Check if command looks like a Codex subcommand (single word, no spaces)
+        # If it has spaces or looks like natural language, treat as a prompt
+        if command and not ' ' in command and command.isascii() and command.strip() == command:
+            # Likely a subcommand - pass through to codex
             full_command = ["codex", command] + args
         else:
-            # Treat command as a prompt for exec subcommand
+            # Treat as a prompt for exec subcommand (use stdin to avoid ARG_MAX)
             is_prompt = True
             prompt_text = command
+            stdin_input = command.encode('utf-8')
 
             full_command = ["codex", "exec", "--skip-git-repo-check"]
 
@@ -326,12 +387,12 @@ async def _run_codex_command(task_id: str, command: str, args: list[str]):
                 full_command.append("--full-auto")
 
             full_command.extend(args)
-            full_command.append(command)
+            full_command.append("-")  # Read from stdin
 
         # Execute Codex CLI
         process = await asyncio.create_subprocess_exec(
             *full_command,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE if stdin_input else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -340,7 +401,7 @@ async def _run_codex_command(task_id: str, command: str, args: list[str]):
 
         try:
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
+                process.communicate(input=stdin_input),
                 timeout=300
             )
         except asyncio.TimeoutError:
@@ -349,6 +410,7 @@ async def _run_codex_command(task_id: str, command: str, args: list[str]):
             task.status = "failed"
             task.error = "Codex CLI command timed out after 300 seconds"
             task.completion_time = datetime.now()
+            await _emit_task_notification(task)
             return
 
         stdout_text = stdout.decode('utf-8') if stdout else ""
@@ -364,13 +426,8 @@ async def _run_codex_command(task_id: str, command: str, args: list[str]):
 
             task.status = "completed"
             task.completion_time = datetime.now()
+            await _emit_task_notification(task)
 
-            # Send MCP notification via context
-            if task.context:
-                try:
-                    await task.context.info(f"Codex command task {task_id} completed successfully")
-                except Exception as e:
-                    print(f"[ERROR] Failed to send notification: {e}", file=sys.stderr, flush=True)
         else:
             error_output = []
             if stdout_text.strip():
@@ -382,6 +439,7 @@ async def _run_codex_command(task_id: str, command: str, args: list[str]):
             task.status = "failed"
             task.error = f"Codex CLI Error (exit code {process.returncode}):\n\n{combined_error}"
             task.completion_time = datetime.now()
+            await _emit_task_notification(task)
 
     except asyncio.CancelledError:
         # Task was cancelled
@@ -393,6 +451,7 @@ async def _run_codex_command(task_id: str, command: str, args: list[str]):
                 await task.process.wait()
             except:
                 pass
+        await _emit_task_notification(task)
         raise
 
     except FileNotFoundError as e:
@@ -402,11 +461,13 @@ async def _run_codex_command(task_id: str, command: str, args: list[str]):
             task.error = f"Error: Path not found or inaccessible: {e.filename or 'unknown'}"
         task.status = "failed"
         task.completion_time = datetime.now()
+        await _emit_task_notification(task)
 
     except Exception as e:
         task.status = "failed"
         task.error = f"Error executing Codex CLI: {str(e)}"
         task.completion_time = datetime.now()
+        await _emit_task_notification(task)
 
 
 @mcp.tool()
@@ -602,6 +663,9 @@ async def cancel_task(task_id: str) -> str:
         # Update task status
         task.status = "cancelled"
         task.completion_time = datetime.now()
+
+        # Emit notification for cancellation
+        await _emit_task_notification(task)
 
         return f"Task {task_id} has been cancelled."
 
