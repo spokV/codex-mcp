@@ -5,12 +5,15 @@ Allows Claude Code to send plans to Codex CLI for review
 """
 
 import asyncio
+import json
 import os
 import re
 import sys
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP, Context
@@ -25,6 +28,10 @@ BYPASS_APPROVALS = os.environ.get("CODEX_BYPASS_APPROVALS", "false").lower() == 
 # Set to False to show full Codex output including prompt templates
 # Set to True to clean output and show only Codex's actual response (default)
 CLEAN_OUTPUT = os.environ.get("CODEX_CLEAN_OUTPUT", "true").lower() == "true"
+
+# Review Memory - stores past findings to avoid repeating the same issues
+REVIEW_MEMORY_FILE = Path("data/review_memory.jsonl")
+REVIEW_MEMORY_MAX_ENTRIES = 100  # Keep only the most recent 100 reviews to prevent endless growth
 
 
 # Task Management
@@ -154,6 +161,98 @@ def clean_codex_output(raw_output: str, original_prompt: str = "") -> str:
     return cleaned
 
 
+def _append_review_memory(review_type: str, files: list[str], result: str, working_directory: str = None):
+    """
+    Append a review finding to the review memory JSONL file.
+    Automatically trims old entries to keep file size bounded.
+
+    Args:
+        review_type: Type of review (plan, code, architecture, security)
+        files: List of files reviewed
+        result: The Codex review output
+        working_directory: Working directory of the review
+    """
+    try:
+        # Ensure data directory exists
+        REVIEW_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        # Create memory entry
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "review_type": review_type,
+            "files": files or [],
+            "working_directory": working_directory or os.getcwd(),
+            "result_summary": result[:500] if result else "",  # Store first 500 chars as summary
+            "resolved": False
+        }
+
+        # Read existing entries (if any) and keep only the most recent ones
+        existing_entries = deque(maxlen=REVIEW_MEMORY_MAX_ENTRIES - 1)  # -1 to make room for new entry
+        if REVIEW_MEMORY_FILE.exists():
+            with open(REVIEW_MEMORY_FILE, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            existing_entries.append(line)
+                        except Exception:
+                            continue
+
+        # Write back the trimmed entries plus the new one
+        with open(REVIEW_MEMORY_FILE, 'w', encoding='utf-8') as f:
+            for line in existing_entries:
+                f.write(line + '\n')
+            f.write(json.dumps(entry) + '\n')
+
+    except Exception as e:
+        # Don't fail the review if memory logging fails
+        print(f"[WARNING] Failed to append to review memory: {e}", file=sys.stderr, flush=True)
+
+
+def _read_review_memory(file_filter: str = None, review_type: str = None, limit: int = 50) -> list[dict]:
+    """
+    Read review memory entries from JSONL file efficiently using deque.
+
+    Args:
+        file_filter: Optional substring to filter by file path
+        review_type: Optional review type to filter by
+        limit: Maximum number of entries to return (most recent first)
+
+    Returns:
+        List of review memory entries
+    """
+    try:
+        if not REVIEW_MEMORY_FILE.exists():
+            return []
+
+        # Use deque with maxlen to efficiently keep only the most recent entries
+        entries = deque(maxlen=limit)
+        with open(REVIEW_MEMORY_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+
+                    # Apply filters
+                    if file_filter and not any(file_filter in f for f in entry.get("files", [])):
+                        continue
+                    if review_type and entry.get("review_type") != review_type:
+                        continue
+
+                    entries.append(entry)
+                except json.JSONDecodeError:
+                    continue
+
+        # Convert to list and return most recent first
+        return list(reversed(entries))
+
+    except Exception as e:
+        print(f"[WARNING] Failed to read review memory: {e}", file=sys.stderr, flush=True)
+        return []
+
+
 async def _run_codex_review(task_id: str, plan: str, context: str, review_type: str,
                             working_directory: str = None, files: list[str] = None):
     """
@@ -228,6 +327,10 @@ async def _run_codex_review(task_id: str, plan: str, context: str, review_type: 
             task.status = "completed"
             task.result = f"Codex CLI Review Results:\n\n{cleaned_output}"
             task.completion_time = datetime.now()
+
+            # Log to review memory
+            _append_review_memory(review_type, files, cleaned_output, working_directory)
+
             await _emit_task_notification(task)
 
         else:
@@ -671,6 +774,83 @@ async def cancel_task(task_id: str) -> str:
 
     except Exception as e:
         return f"Error cancelling task {task_id}: {str(e)}"
+
+
+@mcp.tool()
+async def query_review_memory(
+    file_filter: str = None,
+    review_type: str = None,
+    limit: int = 10
+) -> str:
+    """
+    Query past Codex review findings from review memory.
+
+    Args:
+        file_filter: Optional substring to filter by file path (e.g., "server.py")
+        review_type: Optional review type to filter by (plan, code, architecture, security)
+        limit: Maximum number of entries to return (default: 10, max: 50)
+
+    Returns:
+        Formatted list of past review findings
+    """
+    # Clamp limit to reasonable range
+    limit = max(1, min(limit, 50))
+
+    entries = _read_review_memory(file_filter, review_type, limit)
+
+    if not entries:
+        filters = []
+        if file_filter:
+            filters.append(f"file containing '{file_filter}'")
+        if review_type:
+            filters.append(f"type '{review_type}'")
+
+        filter_text = " and ".join(filters) if filters else "any criteria"
+        return f"No review memory entries found matching {filter_text}."
+
+    # Format results
+    result_lines = [f"Found {len(entries)} review memory entries:\n"]
+
+    for i, entry in enumerate(entries, 1):
+        timestamp = entry.get("timestamp", "unknown")
+        review_type = entry.get("review_type", "unknown")
+        files = entry.get("files", [])
+        files_text = ", ".join(files) if files else "general review"
+        summary = entry.get("result_summary", "")
+        resolved = entry.get("resolved", False)
+        status = "✓ resolved" if resolved else "○ unresolved"
+
+        result_lines.append(f"\n{i}. [{timestamp}] {review_type.upper()} review - {status}")
+        result_lines.append(f"   Files: {files_text}")
+        if summary:
+            # Truncate summary to first 200 chars for display
+            display_summary = summary[:200]
+            if len(summary) > 200:
+                display_summary += "..."
+            result_lines.append(f"   Summary: {display_summary}")
+
+    return "\n".join(result_lines)
+
+
+@mcp.tool()
+async def clear_review_memory() -> str:
+    """
+    Clear all review memory entries with timestamped backup.
+
+    Returns:
+        Confirmation message
+    """
+    try:
+        if REVIEW_MEMORY_FILE.exists():
+            # Backup with timestamp to avoid overwriting previous backups
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = REVIEW_MEMORY_FILE.with_suffix(f'.jsonl.backup.{timestamp}')
+            REVIEW_MEMORY_FILE.rename(backup_path)
+            return f"Review memory cleared. Backup saved to: {backup_path}"
+        else:
+            return "Review memory is already empty (file doesn't exist)."
+    except Exception as e:
+        return f"Error clearing review memory: {str(e)}"
 
 
 # FastMCP auto-discovers tools via @mcp.tool() decorators
