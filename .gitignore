@@ -20,3 +20,6 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime data
+data/review_memory.jsonl

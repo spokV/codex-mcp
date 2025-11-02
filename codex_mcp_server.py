@@ -97,14 +97,17 @@ async def _emit_task_notification(task: Task):
 
     if task.status == "completed":
         message = f"{prefix} {label} finished (task {task.task_id}). Run get_task_result to view the Codex output."
-        await _send_context_message(task, "info", message)
+        level = "info"
+        await _send_context_message(task, level, message)
     elif task.status == "failed":
         summary = _summarize_error(task.error)
         message = f"{prefix} {label} failed (task {task.task_id}). {summary}"
-        await _send_context_message(task, "error", message)
+        level = "error"
+        await _send_context_message(task, level, message)
     elif task.status == "cancelled":
         message = f"{prefix} {label} was cancelled (task {task.task_id})."
-        await _send_context_message(task, "warning", message)
+        level = "warning"
+        await _send_context_message(task, level, message)
 
 
 async def cleanup_old_tasks():
