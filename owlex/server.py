@@ -57,11 +57,17 @@ async def _send_context_message(task: Task, level: str, message: str):
 async def _emit_task_notification(task: Task):
     if not task.context:
         return
-    prefix = "[codex-async]"
+    prefix = "[owlex]"
     if task.status == "completed":
-        await _send_context_message(task, "info", f"{prefix} Codex resume finished (task {task.task_id}). Run get_task_result to view output.")
+        # Include short preview of result
+        preview = ""
+        if task.result:
+            lines = task.result.strip().split('\n')
+            preview = f": {lines[-1][:100]}" if lines else ""
+        await _send_context_message(task, "info", f"{prefix} Task {task.task_id[:8]} completed{preview}")
     elif task.status == "failed":
-        await _send_context_message(task, "error", f"{prefix} Codex resume failed (task {task.task_id}).")
+        error_preview = (task.error or "")[:100]
+        await _send_context_message(task, "error", f"{prefix} Task {task.task_id[:8]} failed: {error_preview}")
 
 
 async def cleanup_old_tasks():
