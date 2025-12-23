@@ -2,6 +2,7 @@
 venv/
 env/
 ENV/
+.venv/
 
 # Python
 __pycache__/
@@ -9,6 +10,9 @@ __pycache__/
 *$py.class
 *.so
 .Python
+*.egg-info/
+build/
+dist/
 
 # IDE
 .vscode/
@@ -21,5 +25,12 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Local config
+.mcp.json
+.claude/
+
+# uv lock file
+uv.lock
+
 # Runtime data
-data/review_memory.jsonl
+data/
