@@ -1,6 +1,13 @@
 # Owlex
 
-MCP server for resuming Codex CLI sessions from Claude Code.
+MCP server for running Codex CLI sessions from Claude Code while maintaining context.
+
+## Features
+
+- **Fresh or resumed sessions** - Start a new Codex session with fresh context, or resume from the last session with full conversation history preserved
+- **Async task execution** - Tasks run in the background; wait for completion with `wait_for_task` or continue working and check results later with `get_task_result`
+- **Working directory support** - Point Codex to any project directory
+- **Web search** - Enable Codex web search for up-to-date information
 
 ## Installation
 
