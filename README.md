@@ -27,9 +27,19 @@ Add to your `.mcp.json`:
 
 ## Tools
 
+### `start_codex_session`
+
+Start a new Codex session (no prior context).
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `prompt` | Yes | Question or request to send |
+| `working_directory` | No | Working directory for Codex |
+| `enable_search` | No | Enable web search |
+
 ### `resume_codex_session`
 
-Resume a Codex session to ask for advice.
+Resume an existing Codex session to ask for advice.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|

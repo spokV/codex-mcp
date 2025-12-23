@@ -155,8 +155,8 @@ async def _run_codex_resume(
             await _emit_task_notification(task)
             return
 
-        stdout_text = stdout.decode('utf-8') if stdout else ""
-        stderr_text = stderr.decode('utf-8') if stderr else ""
+        stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
+        stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
 
         if process.returncode == 0:
             cleaned_output = clean_codex_output(stdout_text, prompt)
@@ -200,6 +200,143 @@ async def _run_codex_resume(
         await _emit_task_notification(task)
 
 
+async def _run_codex_exec(
+    task_id: str,
+    prompt: str,
+    working_directory: str | None = None,
+    enable_search: bool = False
+):
+    """Background coroutine that runs Codex exec (new session) and updates task status"""
+    task = tasks[task_id]
+
+    try:
+        task.status = "running"
+
+        # Build command: codex exec [options] -
+        full_command = ["codex", "exec", "--skip-git-repo-check"]
+
+        if working_directory:
+            full_command.extend(["--cd", working_directory])
+        if enable_search:
+            full_command.append("--search")
+
+        if BYPASS_APPROVALS:
+            full_command.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            full_command.append("--full-auto")
+
+        full_command.append("-")  # Read prompt from stdin
+
+        stdin_input = prompt.encode('utf-8')
+
+        process = await asyncio.create_subprocess_exec(
+            *full_command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        task.process = process
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(input=stdin_input),
+                timeout=300
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            task.status = "failed"
+            task.error = "Codex exec timed out after 300 seconds"
+            task.completion_time = datetime.now()
+            await _emit_task_notification(task)
+            return
+
+        stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
+        stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
+
+        if process.returncode == 0:
+            cleaned_output = clean_codex_output(stdout_text, prompt)
+            task.result = f"Codex Output:\n\n{cleaned_output}"
+            task.status = "completed"
+            task.completion_time = datetime.now()
+            await _emit_task_notification(task)
+        else:
+            error_output = []
+            if stdout_text.strip():
+                error_output.append(f"stdout:\n{stdout_text}")
+            if stderr_text.strip():
+                error_output.append(f"stderr:\n{stderr_text}")
+            task.status = "failed"
+            task.error = f"Codex exec failed (exit code {process.returncode}):\n\n" + ("\n\n".join(error_output) or "No output")
+            task.completion_time = datetime.now()
+            await _emit_task_notification(task)
+
+    except asyncio.CancelledError:
+        task.status = "cancelled"
+        task.completion_time = datetime.now()
+        if task.process:
+            try:
+                task.process.kill()
+                await task.process.wait()
+            except:
+                pass
+        await _emit_task_notification(task)
+        raise
+
+    except FileNotFoundError as e:
+        task.error = "Error: 'codex' command not found. Please ensure Codex CLI is installed and in your PATH." if e.filename == "codex" else f"Error: {e}"
+        task.status = "failed"
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+
+    except Exception as e:
+        task.status = "failed"
+        task.error = f"Error executing Codex: {str(e)}"
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+
+
+@mcp.tool()
+async def start_codex_session(
+    ctx: Context[ServerSession, None],
+    prompt: str = Field(description="The question or request to send"),
+    working_directory: str | None = Field(default=None, description="Working directory for Codex (--cd flag)"),
+    enable_search: bool = Field(default=False, description="Enable web search (--search flag)")
+) -> str:
+    """Start a new Codex session (no prior context)."""
+    if not prompt or not prompt.strip():
+        return "Error: 'prompt' parameter is required."
+
+    if working_directory:
+        working_directory = os.path.expanduser(working_directory)
+        if not os.path.isdir(working_directory):
+            return f"Error: working_directory '{working_directory}' does not exist or is not a directory."
+
+    task_id = str(uuid.uuid4())
+    task = Task(
+        task_id=task_id,
+        status="pending",
+        command="exec",
+        args={
+            "prompt": prompt.strip(),
+            "working_directory": working_directory,
+            "enable_search": enable_search
+        },
+        start_time=datetime.now(),
+        context=ctx
+    )
+
+    tasks[task_id] = task
+
+    task.async_task = asyncio.create_task(_run_codex_exec(
+        task_id, prompt.strip(),
+        working_directory, enable_search
+    ))
+
+    return f"Codex session started. Task ID: {task_id}\n\nUse wait_for_task to get result."
+
+
 @mcp.tool()
 async def resume_codex_session(
     ctx: Context[ServerSession, None],
@@ -214,6 +351,7 @@ async def resume_codex_session(
 
     # Validate working_directory if provided
     if working_directory:
+        working_directory = os.path.expanduser(working_directory)
         if not os.path.isdir(working_directory):
             return f"Error: working_directory '{working_directory}' does not exist or is not a directory."
 
