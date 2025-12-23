@@ -11,8 +11,8 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Optional
 
+from pydantic import Field
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.session import ServerSession
 
@@ -30,12 +30,12 @@ class Task:
     command: str
     args: dict
     start_time: datetime
-    context: Optional[Context[ServerSession, None]] = field(default=None, repr=False)
-    completion_time: Optional[datetime] = None
-    result: Optional[str] = None
-    error: Optional[str] = None
-    async_task: Optional[asyncio.Task] = field(default=None, repr=False)
-    process: Optional[asyncio.subprocess.Process] = field(default=None, repr=False)
+    context: Context[ServerSession, None] | None = field(default=None, repr=False)
+    completion_time: datetime | None = None
+    result: str | None = None
+    error: str | None = None
+    async_task: asyncio.Task | None = field(default=None, repr=False)
+    process: asyncio.subprocess.Process | None = field(default=None, repr=False)
 
 
 # Global task storage
@@ -99,7 +99,7 @@ async def _run_codex_resume(
     task_id: str,
     session_ref: str,
     prompt: str,
-    working_directory: Optional[str] = None,
+    working_directory: str | None = None,
     enable_search: bool = False
 ):
     """Background coroutine that runs Codex resume and updates task status"""
@@ -202,24 +202,13 @@ async def _run_codex_resume(
 
 @mcp.tool()
 async def resume_codex_session(
-    prompt: str,
     ctx: Context[ServerSession, None],
-    session_id: Optional[str] = None,
-    working_directory: Optional[str] = None,
-    enable_search: bool = False
+    prompt: str = Field(description="The question or request to send to the resumed session"),
+    session_id: str | None = Field(default=None, description="Session ID to resume (uses --last if not provided)"),
+    working_directory: str | None = Field(default=None, description="Working directory for Codex (--cd flag)"),
+    enable_search: bool = Field(default=False, description="Enable web search (--search flag)")
 ) -> str:
-    """
-    Resume an existing Codex session and ask for advice.
-
-    Uses 'codex exec resume [session-id]' to continue a previous session
-    with full context preserved.
-
-    Args:
-        prompt: The question or request to send to the resumed session
-        session_id: The Codex session ID to resume (optional, uses --last if not provided)
-        working_directory: Directory for Codex to use as working root (--cd flag)
-        enable_search: Enable web search capability (--search flag)
-    """
+    """Resume an existing Codex session and ask for advice."""
     if not prompt or not prompt.strip():
         return "Error: 'prompt' parameter is required."
 
