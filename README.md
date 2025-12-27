@@ -1,5 +1,10 @@
 # Owlex
 
+[![Version](https://img.shields.io/badge/version-0.1.1-blue)](https://github.com/agentic-mcp-tools/owlex/releases)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10+-blue)](https://python.org)
+[![MCP](https://img.shields.io/badge/MCP-compatible-purple)](https://modelcontextprotocol.io)
+
 MCP server for running Codex CLI and Gemini CLI sessions from Claude Code while maintaining context.
 
 ## Features

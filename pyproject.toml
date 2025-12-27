@@ -4,10 +4,21 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "owlex"
-version = "0.2.0"
+version = "0.1.1"
 description = "MCP server for Codex CLI and Gemini CLI integration with Claude Code"
+license = "MIT"
 readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["mcp", "claude", "codex", "gemini", "ai", "llm", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "mcp>=1.0.0",
     "pydantic>=2.0.0",
