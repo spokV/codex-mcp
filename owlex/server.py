@@ -14,18 +14,9 @@ from pydantic import Field
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.session import ServerSession
 
-from .models import (
-    TaskResponse,
-    ClaudeOpinion,
-    CouncilResponse,
-    CouncilRound,
-    CouncilMetadata,
-)
-from .engine import (
-    engine,
-    build_agent_response,
-    DEFAULT_TIMEOUT,
-)
+from .models import TaskResponse, ErrorCode, Agent
+from .engine import engine, DEFAULT_TIMEOUT, codex_runner, gemini_runner
+from .council import Council
 
 
 # Initialize FastMCP server
@@ -47,47 +38,6 @@ def _validate_working_directory(working_directory: str | None) -> tuple[str | No
     return expanded, None
 
 
-async def _kill_task_subprocess(task):
-    """Kill subprocess for a task if it's still running."""
-    if task.process and task.process.returncode is None:
-        try:
-            task.process.kill()
-            await task.process.wait()
-        except Exception:
-            pass
-    if task.async_task and not task.async_task.done():
-        task.async_task.cancel()
-        try:
-            await task.async_task
-        except asyncio.CancelledError:
-            pass
-
-
-async def _run_council_tasks(tasks: list, timeout: int, log_func) -> list[Exception | None]:
-    """
-    Run council tasks with proper timeout handling and cleanup.
-    Returns list of exceptions (or None for successful tasks).
-    """
-    results = await asyncio.gather(
-        *[t.async_task for t in tasks],
-        return_exceptions=True
-    )
-
-    # Check for timeouts and cleanup any still-running processes
-    for i, (task, result) in enumerate(zip(tasks, results)):
-        if isinstance(result, asyncio.TimeoutError):
-            log_func(f"{task.command} timed out after {timeout}s")
-            await _kill_task_subprocess(task)
-            task.status = "failed"
-            task.error = f"Timed out after {timeout} seconds"
-            task.completion_time = datetime.now()
-        elif isinstance(result, Exception):
-            log_func(f"{task.command} failed: {result}")
-            await _kill_task_subprocess(task)
-
-    return results
-
-
 # === Codex Tools ===
 
 @mcp.tool()
@@ -95,24 +45,25 @@ async def start_codex_session(
     ctx: Context[ServerSession, None],
     prompt: str = Field(description="The question or request to send"),
     working_directory: str | None = Field(default=None, description="Working directory for Codex (--cd flag)"),
-    enable_search: bool = Field(default=False, description="Enable web search (--search flag)")
+    enable_search: bool = Field(default=True, description="Enable web search (--search flag)")
 ) -> str:
     """Start a new Codex session (no prior context)."""
     if not prompt or not prompt.strip():
-        return TaskResponse(success=False, error="'prompt' parameter is required.").model_dump_json()
+        return TaskResponse(success=False, error="'prompt' parameter is required.", error_code=ErrorCode.INVALID_ARGS).model_dump_json()
 
     working_directory, error = _validate_working_directory(working_directory)
     if error:
-        return TaskResponse(success=False, error=error).model_dump_json()
+        return TaskResponse(success=False, error=error, error_code=ErrorCode.INVALID_ARGS).model_dump_json()
 
     task = engine.create_task(
-        command="codex_exec",
+        command=f"{Agent.CODEX.value}_exec",
         args={"prompt": prompt.strip(), "working_directory": working_directory, "enable_search": enable_search},
         context=ctx,
     )
 
-    task.async_task = asyncio.create_task(engine.run_codex_exec(
-        task, prompt.strip(), working_directory, enable_search
+    task.async_task = asyncio.create_task(engine.run_agent(
+        task, codex_runner, mode="exec",
+        prompt=prompt.strip(), working_directory=working_directory, enable_search=enable_search
     ))
 
     return TaskResponse(
@@ -129,27 +80,28 @@ async def resume_codex_session(
     prompt: str = Field(description="The question or request to send to the resumed session"),
     session_id: str | None = Field(default=None, description="Session ID to resume (uses --last if not provided)"),
     working_directory: str | None = Field(default=None, description="Working directory for Codex (--cd flag)"),
-    enable_search: bool = Field(default=False, description="Enable web search (--search flag)")
+    enable_search: bool = Field(default=True, description="Enable web search (--search flag)")
 ) -> str:
     """Resume an existing Codex session and ask for advice."""
     if not prompt or not prompt.strip():
-        return TaskResponse(success=False, error="'prompt' parameter is required.").model_dump_json()
+        return TaskResponse(success=False, error="'prompt' parameter is required.", error_code=ErrorCode.INVALID_ARGS).model_dump_json()
 
     working_directory, error = _validate_working_directory(working_directory)
     if error:
-        return TaskResponse(success=False, error=error).model_dump_json()
+        return TaskResponse(success=False, error=error, error_code=ErrorCode.INVALID_ARGS).model_dump_json()
 
     use_last = not session_id or not session_id.strip()
     session_ref = "--last" if use_last else session_id.strip()
 
     task = engine.create_task(
-        command="codex_resume",
+        command=f"{Agent.CODEX.value}_resume",
         args={"session_id": session_ref, "prompt": prompt.strip(), "working_directory": working_directory, "enable_search": enable_search},
         context=ctx,
     )
 
-    task.async_task = asyncio.create_task(engine.run_codex_resume(
-        task, session_ref, prompt.strip(), working_directory, enable_search
+    task.async_task = asyncio.create_task(engine.run_agent(
+        task, codex_runner, mode="resume",
+        prompt=prompt.strip(), session_ref=session_ref, working_directory=working_directory, enable_search=enable_search
     ))
 
     return TaskResponse(
@@ -170,20 +122,21 @@ async def start_gemini_session(
 ) -> str:
     """Start a new Gemini CLI session (no prior context)."""
     if not prompt or not prompt.strip():
-        return TaskResponse(success=False, error="'prompt' parameter is required.").model_dump_json()
+        return TaskResponse(success=False, error="'prompt' parameter is required.", error_code=ErrorCode.INVALID_ARGS).model_dump_json()
 
     working_directory, error = _validate_working_directory(working_directory)
     if error:
-        return TaskResponse(success=False, error=error).model_dump_json()
+        return TaskResponse(success=False, error=error, error_code=ErrorCode.INVALID_ARGS).model_dump_json()
 
     task = engine.create_task(
-        command="gemini_exec",
+        command=f"{Agent.GEMINI.value}_exec",
         args={"prompt": prompt.strip(), "working_directory": working_directory},
         context=ctx,
     )
 
-    task.async_task = asyncio.create_task(engine.run_gemini_exec(
-        task, prompt.strip(), working_directory
+    task.async_task = asyncio.create_task(engine.run_agent(
+        task, gemini_runner, mode="exec",
+        prompt=prompt.strip(), working_directory=working_directory
     ))
 
     return TaskResponse(
@@ -203,20 +156,21 @@ async def resume_gemini_session(
 ) -> str:
     """Resume an existing Gemini CLI session with full conversation history."""
     if not prompt or not prompt.strip():
-        return TaskResponse(success=False, error="'prompt' parameter is required.").model_dump_json()
+        return TaskResponse(success=False, error="'prompt' parameter is required.", error_code=ErrorCode.INVALID_ARGS).model_dump_json()
 
     working_directory, error = _validate_working_directory(working_directory)
     if error:
-        return TaskResponse(success=False, error=error).model_dump_json()
+        return TaskResponse(success=False, error=error, error_code=ErrorCode.INVALID_ARGS).model_dump_json()
 
     task = engine.create_task(
-        command="gemini_resume",
+        command=f"{Agent.GEMINI.value}_resume",
         args={"session_ref": session_ref, "prompt": prompt.strip(), "working_directory": working_directory},
         context=ctx,
     )
 
-    task.async_task = asyncio.create_task(engine.run_gemini_resume(
-        task, session_ref, prompt.strip(), working_directory
+    task.async_task = asyncio.create_task(engine.run_agent(
+        task, gemini_runner, mode="resume",
+        prompt=prompt.strip(), session_ref=session_ref, working_directory=working_directory
     ))
 
     return TaskResponse(
@@ -239,7 +193,7 @@ async def get_task_result(task_id: str) -> str:
     """
     task = engine.get_task(task_id)
     if not task:
-        return TaskResponse(success=False, error=f"Task '{task_id}' not found.").model_dump_json()
+        return TaskResponse(success=False, error=f"Task '{task_id}' not found.", error_code=ErrorCode.NOT_FOUND).model_dump_json()
 
     if task.status == "pending":
         return TaskResponse(
@@ -262,6 +216,7 @@ async def get_task_result(task_id: str) -> str:
             task_id=task_id,
             status=task.status,
             content=task.result,
+            warnings=task.warnings,
             duration_seconds=(task.completion_time - task.start_time).total_seconds() if task.completion_time else None,
         ).model_dump_json()
     elif task.status == "failed":
@@ -270,6 +225,7 @@ async def get_task_result(task_id: str) -> str:
             task_id=task_id,
             status=task.status,
             error=task.error,
+            error_code=ErrorCode.EXECUTION_FAILED,
             duration_seconds=(task.completion_time - task.start_time).total_seconds() if task.completion_time else None,
         ).model_dump_json()
     else:
@@ -291,7 +247,7 @@ async def wait_for_task(task_id: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """
     task = engine.get_task(task_id)
     if not task:
-        return TaskResponse(success=False, error=f"Task '{task_id}' not found.").model_dump_json()
+        return TaskResponse(success=False, error=f"Task '{task_id}' not found.", error_code=ErrorCode.NOT_FOUND).model_dump_json()
 
     if task.status in ["completed", "failed", "cancelled"]:
         if task.status == "completed":
@@ -300,13 +256,16 @@ async def wait_for_task(task_id: str, timeout: int = DEFAULT_TIMEOUT) -> str:
                 task_id=task_id,
                 status=task.status,
                 content=task.result,
+                warnings=task.warnings,
                 duration_seconds=(task.completion_time - task.start_time).total_seconds() if task.completion_time else None,
             ).model_dump_json()
+        error_code = ErrorCode.EXECUTION_FAILED if task.status == "failed" else ErrorCode.CANCELLED
         return TaskResponse(
             success=False,
             task_id=task_id,
             status=task.status,
             error=task.error,
+            error_code=error_code,
         ).model_dump_json()
 
     if task.async_task:
@@ -318,12 +277,14 @@ async def wait_for_task(task_id: str, timeout: int = DEFAULT_TIMEOUT) -> str:
                 task_id=task_id,
                 status="timeout",
                 error=f"Task still running after {timeout}s. Use get_task_result to check later.",
+                error_code=ErrorCode.TIMEOUT,
             ).model_dump_json()
         except Exception as e:
             return TaskResponse(
                 success=False,
                 task_id=task_id,
                 error=f"Task failed: {str(e)}",
+                error_code=ErrorCode.INTERNAL_ERROR,
             ).model_dump_json()
 
     if task.status == "completed":
@@ -332,14 +293,17 @@ async def wait_for_task(task_id: str, timeout: int = DEFAULT_TIMEOUT) -> str:
             task_id=task_id,
             status=task.status,
             content=task.result,
+            warnings=task.warnings,
             duration_seconds=(task.completion_time - task.start_time).total_seconds() if task.completion_time else None,
         ).model_dump_json()
 
+    error_code = ErrorCode.EXECUTION_FAILED if task.status == "failed" else ErrorCode.CANCELLED
     return TaskResponse(
         success=False,
         task_id=task_id,
         status=task.status,
         error=task.error,
+        error_code=error_code,
     ).model_dump_json()
 
 
@@ -386,7 +350,7 @@ async def cancel_task(task_id: str) -> str:
     """
     task = engine.get_task(task_id)
     if not task:
-        return TaskResponse(success=False, error=f"Task '{task_id}' not found.").model_dump_json()
+        return TaskResponse(success=False, error=f"Task '{task_id}' not found.", error_code=ErrorCode.NOT_FOUND).model_dump_json()
 
     if task.status in ["completed", "failed", "cancelled"]:
         return TaskResponse(
@@ -394,10 +358,11 @@ async def cancel_task(task_id: str) -> str:
             task_id=task_id,
             status=task.status,
             error=f"Task already {task.status}, cannot cancel.",
+            error_code=ErrorCode.INVALID_ARGS,
         ).model_dump_json()
 
     # Kill the subprocess and cancel the async task
-    await _kill_task_subprocess(task)
+    await engine.kill_task_subprocess(task)
     task.status = "cancelled"
     task.error = "Cancelled by user"
     task.completion_time = datetime.now()
@@ -419,6 +384,7 @@ async def council_ask(
     claude_opinion: str | None = Field(default=None, description="Claude's initial opinion to share with the council"),
     working_directory: str | None = Field(default=None, description="Working directory for context"),
     deliberate: bool = Field(default=True, description="If true, share answers between agents for a second round of deliberation"),
+    critique: bool = Field(default=False, description="If true, round 2 asks agents to critique/find flaws instead of revise"),
     timeout: int = Field(default=DEFAULT_TIMEOUT, description="Timeout per agent in seconds"),
 ) -> str:
     """
@@ -432,6 +398,9 @@ async def council_ask(
 
     If deliberate=True, shares all answers (including Claude's) with each agent
     for a second round, allowing them to revise after seeing others' responses.
+
+    If critique=True, round 2 asks agents to find bugs, security issues, and
+    architectural flaws instead of politely revising their answers.
     """
     if not prompt or not prompt.strip():
         return json.dumps({"error": "'prompt' parameter is required."})
@@ -440,176 +409,15 @@ async def council_ask(
     if error:
         return json.dumps({"error": error})
 
-    prompt = prompt.strip()
-    council_start = datetime.now()
-    log_entries: list[str] = []
-
-    def log(msg: str):
-        """Add to log and print to stderr."""
-        log_entries.append(msg)
-        _log(msg)
-
-    # === Round 1: Parallel initial queries ===
-    if claude_opinion and claude_opinion.strip():
-        log(f"Claude's opinion received ({len(claude_opinion)} chars)")
-    log("Round 1: querying Codex and Gemini...")
-
-    codex_task = engine.create_task(
-        command="council_codex",
-        args={"prompt": prompt, "working_directory": working_directory},
-        context=ctx,
-    )
-    gemini_task = engine.create_task(
-        command="council_gemini",
-        args={"prompt": prompt, "working_directory": working_directory},
-        context=ctx,
-    )
-
-    round1_start = datetime.now()
-
-    async def run_and_notify_codex():
-        await engine.run_codex_exec(codex_task, prompt, working_directory, enable_search=False)
-        elapsed = (datetime.now() - round1_start).total_seconds()
-        status = "completed" if codex_task.status == "completed" else "failed"
-        log(f"Codex {status} ({elapsed:.1f}s)")
-
-    async def run_and_notify_gemini():
-        await engine.run_gemini_exec(gemini_task, prompt, working_directory)
-        elapsed = (datetime.now() - round1_start).total_seconds()
-        status = "completed" if gemini_task.status == "completed" else "failed"
-        log(f"Gemini {status} ({elapsed:.1f}s)")
-
-    codex_task.async_task = asyncio.create_task(run_and_notify_codex())
-    gemini_task.async_task = asyncio.create_task(run_and_notify_gemini())
-
-    # Wait for both tasks with timeout, then cleanup any that didn't complete
-    done, pending = await asyncio.wait(
-        [codex_task.async_task, gemini_task.async_task],
-        timeout=timeout,
-        return_when=asyncio.ALL_COMPLETED
-    )
-
-    # Kill subprocesses for any tasks that timed out
-    for task in [codex_task, gemini_task]:
-        if task.async_task in pending:
-            log(f"{task.command} timed out")
-            await _kill_task_subprocess(task)
-            task.status = "failed"
-            task.error = f"Timed out after {timeout} seconds"
-            task.completion_time = datetime.now()
-
-    round1_elapsed = (datetime.now() - round1_start).total_seconds()
-    log(f"Round 1 complete ({round1_elapsed:.1f}s)")
-
-    round_1 = CouncilRound(
-        codex=build_agent_response(codex_task, "codex"),
-        gemini=build_agent_response(gemini_task, "gemini"),
-    )
-
-    round_2 = None
-
-    # === Round 2: Deliberation (optional) ===
-    if deliberate:
-        log("Round 2: deliberation phase...")
-
-        codex_content = round_1.codex.content or round_1.codex.error or "(no response)"
-        gemini_content = round_1.gemini.content or round_1.gemini.error or "(no response)"
-        claude_content = claude_opinion.strip() if claude_opinion else None
-
-        # Build deliberation prompt with all available opinions
-        deliberation_parts = [
-            "You previously answered a question. Now review all council members' answers and provide your revised opinion.",
-            "",
-            "ORIGINAL QUESTION:",
-            prompt,
-        ]
-
-        if claude_content:
-            deliberation_parts.extend(["", "CLAUDE'S ANSWER:", claude_content])
-
-        deliberation_parts.extend([
-            "",
-            "CODEX'S ANSWER:",
-            codex_content,
-            "",
-            "GEMINI'S ANSWER:",
-            gemini_content,
-            "",
-            "Please provide your revised answer after considering the other perspectives. Note any points of agreement or disagreement.",
-        ])
-
-        deliberation_prompt = "\n".join(deliberation_parts)
-
-        codex_delib_task = engine.create_task(
-            command="council_codex_delib",
-            args={"prompt": deliberation_prompt, "working_directory": working_directory},
-            context=ctx,
-        )
-        gemini_delib_task = engine.create_task(
-            command="council_gemini_delib",
-            args={"prompt": deliberation_prompt, "working_directory": working_directory},
-            context=ctx,
-        )
-
-        round2_start = datetime.now()
-
-        async def run_and_notify_codex_delib():
-            await engine.run_codex_exec(codex_delib_task, deliberation_prompt, working_directory, enable_search=False)
-            elapsed = (datetime.now() - round2_start).total_seconds()
-            log(f"Codex revised ({elapsed:.1f}s)")
-
-        async def run_and_notify_gemini_delib():
-            await engine.run_gemini_exec(gemini_delib_task, deliberation_prompt, working_directory)
-            elapsed = (datetime.now() - round2_start).total_seconds()
-            log(f"Gemini revised ({elapsed:.1f}s)")
-
-        codex_delib_task.async_task = asyncio.create_task(run_and_notify_codex_delib())
-        gemini_delib_task.async_task = asyncio.create_task(run_and_notify_gemini_delib())
-
-        # Wait for both tasks with timeout, then cleanup any that didn't complete
-        done, pending = await asyncio.wait(
-            [codex_delib_task.async_task, gemini_delib_task.async_task],
-            timeout=timeout,
-            return_when=asyncio.ALL_COMPLETED
-        )
-
-        # Kill subprocesses for any tasks that timed out
-        for task in [codex_delib_task, gemini_delib_task]:
-            if task.async_task in pending:
-                log(f"{task.command} timed out")
-                await _kill_task_subprocess(task)
-                task.status = "failed"
-                task.error = f"Timed out after {timeout} seconds"
-                task.completion_time = datetime.now()
-
-        round2_elapsed = (datetime.now() - round2_start).total_seconds()
-        log(f"Round 2 complete ({round2_elapsed:.1f}s)")
-
-        round_2 = CouncilRound(
-            codex=build_agent_response(codex_delib_task, "codex"),
-            gemini=build_agent_response(gemini_delib_task, "gemini"),
-        )
-
-    # Build Claude opinion object if provided
-    claude_opinion_obj = None
-    if claude_opinion and claude_opinion.strip():
-        claude_opinion_obj = ClaudeOpinion(
-            content=claude_opinion.strip(),
-            provided_at=council_start.isoformat(),
-        )
-
-    response = CouncilResponse(
-        prompt=prompt,
+    # Use the Council class for orchestration
+    council = Council(context=ctx)
+    response = await council.deliberate(
+        prompt=prompt.strip(),
         working_directory=working_directory,
-        deliberation=deliberate,
-        claude_opinion=claude_opinion_obj,
-        round_1=round_1,
-        round_2=round_2,
-        metadata=CouncilMetadata(
-            total_duration_seconds=(datetime.now() - council_start).total_seconds(),
-            rounds=2 if deliberate else 1,
-            log=log_entries,
-        ),
+        claude_opinion=claude_opinion,
+        deliberate=deliberate,
+        critique=critique,
+        timeout=timeout,
     )
 
     return response.model_dump_json(indent=2)
@@ -617,12 +425,47 @@ async def council_ask(
 
 def main():
     """Entry point for owlex-server command."""
+    import signal
+
     async def run_with_cleanup():
+        loop = asyncio.get_running_loop()
+        shutdown_event = asyncio.Event()
+
+        def signal_handler(sig):
+            _log(f"Received signal {sig}, shutting down...")
+            shutdown_event.set()
+
+        # Register signal handlers for graceful shutdown
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: signal_handler(s))
+            except NotImplementedError:
+                # Windows doesn't support add_signal_handler
+                pass
+
         engine.start_cleanup_loop()
         try:
-            await mcp.run_stdio_async()
+            # Run MCP server with shutdown monitoring
+            server_task = asyncio.create_task(mcp.run_stdio_async())
+            shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+            done, pending = await asyncio.wait(
+                [server_task, shutdown_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            # If shutdown was triggered, cancel the server
+            if shutdown_task in done:
+                server_task.cancel()
+                try:
+                    await server_task
+                except asyncio.CancelledError:
+                    pass
         finally:
+            # Kill all running tasks before exit
+            await engine.kill_all_tasks()
             engine.stop_cleanup_loop()
+            _log("Server shutdown complete.")
 
     asyncio.run(run_with_cleanup())
 

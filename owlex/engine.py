@@ -4,53 +4,16 @@ Handles subprocess management, streaming, and task lifecycle.
 """
 
 import asyncio
-import os
-import re
 import sys
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
-from .models import Task, TaskStatus, AgentResponse
-
-
-# Configuration - Codex
-BYPASS_APPROVALS = os.environ.get("CODEX_BYPASS_APPROVALS", "false").lower() == "true"
-CLEAN_OUTPUT = os.environ.get("CODEX_CLEAN_OUTPUT", "true").lower() == "true"
-
-# Configuration - Gemini
-GEMINI_YOLO_MODE = os.environ.get("GEMINI_YOLO_MODE", "false").lower() == "true"
-GEMINI_CLEAN_OUTPUT = os.environ.get("GEMINI_CLEAN_OUTPUT", "true").lower() == "true"
-
-DEFAULT_TIMEOUT = 300
-
-
-def clean_codex_output(raw_output: str, original_prompt: str = "") -> str:
-    """Clean Codex CLI output by removing echoed prompt templates."""
-    if not CLEAN_OUTPUT:
-        return raw_output
-    cleaned = raw_output
-    if original_prompt and cleaned.startswith(original_prompt):
-        cleaned = cleaned[len(original_prompt):].lstrip()
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-    return cleaned.strip()
-
-
-def clean_gemini_output(raw_output: str, original_prompt: str = "") -> str:
-    """Clean Gemini CLI output by removing noise."""
-    if not GEMINI_CLEAN_OUTPUT:
-        return raw_output
-    cleaned = raw_output
-    if cleaned.startswith("YOLO mode is enabled."):
-        lines = cleaned.split('\n', 2)
-        if len(lines) > 2:
-            cleaned = lines[2]
-        elif len(lines) > 1:
-            cleaned = lines[1]
-    cleaned = re.sub(r'^Loaded cached credentials\.\n?', '', cleaned, flags=re.MULTILINE)
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-    return cleaned.strip()
+from .config import config
+from .models import Task, TaskStatus, AgentResponse, Agent
+from .agents import CodexRunner, GeminiRunner
+from .agents.base import AgentRunner, AgentCommand
 
 
 def extract_content(result: str | None, prefix: str) -> str:
@@ -62,16 +25,19 @@ def extract_content(result: str | None, prefix: str) -> str:
     return result.strip()
 
 
-def build_agent_response(task: Task, agent: str) -> AgentResponse:
+def build_agent_response(task: Task, agent: Agent | str) -> AgentResponse:
     """Build structured response for an agent."""
+    # Normalize to string for backward compatibility
+    agent_name = agent.value if isinstance(agent, Agent) else agent
+
     prefix_map = {
-        "codex": "Codex Output:\n\n",
-        "gemini": "Gemini Output:\n\n",
+        Agent.CODEX.value: "Codex Output:\n\n",
+        Agent.GEMINI.value: "Gemini Output:\n\n",
     }
-    prefix = prefix_map.get(agent, "")
+    prefix = prefix_map.get(agent_name, "")
 
     return AgentResponse(
-        agent=agent,
+        agent=agent_name,
         status=task.status,
         content=extract_content(task.result, prefix) if task.status == "completed" else None,
         error=task.error if task.status == "failed" else None,
@@ -86,6 +52,16 @@ def build_agent_response(task: Task, agent: str) -> AgentResponse:
 # Type alias for notification callback
 NotifyCallback = Callable[[str, str], Any] | None
 
+# Agent runner instances - available for import by other modules
+codex_runner = CodexRunner()
+gemini_runner = GeminiRunner()
+
+# Map Agent enum to runner instances
+AGENT_RUNNERS: dict[Agent, AgentRunner] = {
+    Agent.CODEX: codex_runner,
+    Agent.GEMINI: gemini_runner,
+}
+
 
 class TaskEngine:
     """
@@ -96,6 +72,8 @@ class TaskEngine:
     def __init__(self):
         self.tasks: dict[str, Task] = {}
         self._cleanup_task: asyncio.Task | None = None
+        # Print security warnings on initialization
+        config.print_warnings()
 
     def start_cleanup_loop(self):
         """Start background task cleanup loop."""
@@ -107,6 +85,41 @@ class TaskEngine:
         if self._cleanup_task:
             self._cleanup_task.cancel()
             self._cleanup_task = None
+
+    async def _terminate_process(self, process: asyncio.subprocess.Process, grace_period: float = 2.0):
+        """Gracefully terminate a process: SIGTERM first, then SIGKILL after grace period."""
+        if process.returncode is not None:
+            return  # Already terminated
+        try:
+            process.terminate()  # SIGTERM - allow graceful cleanup
+            try:
+                await asyncio.wait_for(process.wait(), timeout=grace_period)
+            except asyncio.TimeoutError:
+                # Process didn't exit gracefully, force kill
+                process.kill()  # SIGKILL
+                await process.wait()
+        except Exception:
+            pass
+
+    async def kill_task_subprocess(self, task: Task):
+        """Kill subprocess for a task if it's still running."""
+        if task.process and task.process.returncode is None:
+            await self._terminate_process(task.process)
+        if task.async_task and not task.async_task.done():
+            task.async_task.cancel()
+            try:
+                await task.async_task
+            except asyncio.CancelledError:
+                pass
+
+    async def kill_all_tasks(self):
+        """Kill all running tasks and their subprocesses. Used for graceful shutdown."""
+        for task_id, task in list(self.tasks.items()):
+            if task.status in [TaskStatus.PENDING.value, TaskStatus.RUNNING.value]:
+                await self.kill_task_subprocess(task)
+                task.status = TaskStatus.CANCELLED.value
+                task.error = "Server shutdown"
+                task.completion_time = datetime.now()
 
     async def _cleanup_old_tasks(self):
         """Background task to clean up completed tasks after 5 minutes."""
@@ -209,14 +222,52 @@ class TaskEngine:
         output_cleaner: Callable[[str, str], str],
         output_prefix: str,
         cwd: str | None = None,
-        timeout: int = DEFAULT_TIMEOUT,
+        timeout: int | None = None,
         not_found_hint: str | None = None,
         stream: bool = False,
     ):
         """
-        Run a subprocess command for a task.
-        Handles process creation, timeouts, output cleaning, and status updates.
+        Run a subprocess command for a task (legacy interface).
+        Wraps run_agent_command for backward compatibility.
         """
+        agent_cmd = AgentCommand(
+            command=command,
+            prompt=prompt,
+            cwd=cwd,
+            output_prefix=output_prefix,
+            not_found_hint=not_found_hint,
+            stream=stream,
+        )
+        await self.run_agent_command(task, agent_cmd, timeout)
+        # Apply output cleaner to result
+        if task.result and task.status == "completed":
+            prefix = f"{output_prefix}:\n\n"
+            if task.result.startswith(prefix):
+                content = task.result[len(prefix):]
+                cleaned = output_cleaner(content, prompt)
+                task.result = f"{prefix}{cleaned}"
+
+    async def run_agent_command(
+        self,
+        task: Task,
+        agent_cmd: AgentCommand,
+        timeout: int | None = None,
+    ):
+        """
+        Run a subprocess command for a task using an AgentCommand specification.
+        This is the unified method for running any agent.
+        """
+        if timeout is None:
+            timeout = config.default_timeout
+
+        command = agent_cmd.command
+        prompt = agent_cmd.prompt
+        output_cleaner = lambda stdout, p: stdout  # Default no-op cleaner
+        output_prefix = agent_cmd.output_prefix
+        cwd = agent_cmd.cwd
+        not_found_hint = agent_cmd.not_found_hint
+        stream = agent_cmd.stream
+
         try:
             task.status = TaskStatus.RUNNING.value
             task.output_lines = []
@@ -238,14 +289,17 @@ class TaskEngine:
                     process.stdin.write(prompt.encode('utf-8'))
                     await process.stdin.drain()
                 process.stdin.close()
+
+                # Create reader tasks - track them for explicit cleanup on timeout
+                stdout_task = asyncio.create_task(
+                    self._read_stream_lines(process.stdout, task, "stdout")
+                )
+                stderr_task = asyncio.create_task(
+                    self._read_stream_lines(process.stderr, task, "stderr")
+                )
+
                 try:
                     async def read_with_timeout():
-                        stdout_task = asyncio.create_task(
-                            self._read_stream_lines(process.stdout, task, "stdout")
-                        )
-                        stderr_task = asyncio.create_task(
-                            self._read_stream_lines(process.stderr, task, "stderr")
-                        )
                         stdout_text, stderr_text = await asyncio.gather(stdout_task, stderr_task)
                         await process.wait()
                         return stdout_text, stderr_text
@@ -255,8 +309,15 @@ class TaskEngine:
                         timeout=timeout
                     )
                 except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
+                    # Cancel reader tasks explicitly to prevent zombie tasks
+                    stdout_task.cancel()
+                    stderr_task.cancel()
+                    try:
+                        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                    except Exception:
+                        pass
+                    # Graceful termination: SIGTERM first, then SIGKILL
+                    await self._terminate_process(process)
                     task.status = TaskStatus.FAILED.value
                     task.error = f"{command[0]} command timed out after {timeout} seconds"
                     task.completion_time = datetime.now()
@@ -273,8 +334,8 @@ class TaskEngine:
                     stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
                     stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
                 except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
+                    # Graceful termination: SIGTERM first, then SIGKILL
+                    await self._terminate_process(process)
                     task.status = TaskStatus.FAILED.value
                     task.error = f"{command[0]} command timed out after {timeout} seconds"
                     task.completion_time = datetime.now()
@@ -286,6 +347,9 @@ class TaskEngine:
             if process.returncode == 0:
                 cleaned_output = output_cleaner(stdout_text, prompt)
                 task.result = f"{output_prefix}:\n\n{cleaned_output}"
+                # Capture stderr as warnings even on success (CLI tools often emit warnings)
+                if stderr_text.strip():
+                    task.warnings = stderr_text.strip()
                 task.status = TaskStatus.COMPLETED.value
                 task.completion_time = datetime.now()
                 await self._emit_task_notification(task)
@@ -332,138 +396,64 @@ class TaskEngine:
             task.stream_complete = True
             await self._emit_task_notification(task)
 
-    # === Codex Runners ===
+    # === Unified agent execution method ===
 
-    async def run_codex_exec(
+    async def run_agent(
         self,
         task: Task,
-        prompt: str,
+        runner: AgentRunner,
+        mode: str = "exec",
+        prompt: str = "",
         working_directory: str | None = None,
+        session_ref: str | None = None,
         enable_search: bool = False,
-        stream: bool = True,
+        timeout: int | None = None,
     ):
-        """Run Codex exec (new session)."""
-        full_command = ["codex", "exec", "--skip-git-repo-check"]
+        """
+        Run an agent using the unified polymorphic pattern.
 
-        if working_directory:
-            full_command.extend(["--cd", working_directory])
-        if enable_search:
-            full_command.append("--search")
-
-        if BYPASS_APPROVALS:
-            full_command.append("--dangerously-bypass-approvals-and-sandbox")
+        Args:
+            task: The Task object to execute
+            runner: AgentRunner instance (codex_runner or gemini_runner)
+            mode: "exec" for new session, "resume" for existing session
+            prompt: The prompt to send
+            working_directory: Working directory for the agent
+            session_ref: Session reference (required for resume mode)
+            enable_search: Enable web search (Codex only)
+            timeout: Timeout in seconds
+        """
+        if mode == "exec":
+            agent_cmd = runner.build_exec_command(
+                prompt=prompt,
+                working_directory=working_directory,
+                enable_search=enable_search,
+            )
+        elif mode == "resume":
+            if session_ref is None:
+                raise ValueError("session_ref is required for resume mode")
+            agent_cmd = runner.build_resume_command(
+                session_ref=session_ref,
+                prompt=prompt,
+                working_directory=working_directory,
+                enable_search=enable_search,
+            )
         else:
-            full_command.append("--full-auto")
+            raise ValueError(f"Invalid mode: {mode}. Must be 'exec' or 'resume'")
 
-        full_command.append("-")
+        await self.run_agent_command(task, agent_cmd, timeout=timeout)
 
-        await self.run_command(
-            task=task,
-            command=full_command,
-            prompt=prompt,
-            output_cleaner=clean_codex_output,
-            output_prefix="Codex Output",
-            not_found_hint="Please ensure Codex CLI is installed and in your PATH.",
-            stream=stream,
-        )
-
-    async def run_codex_resume(
-        self,
-        task: Task,
-        session_ref: str,
-        prompt: str,
-        working_directory: str | None = None,
-        enable_search: bool = False,
-    ):
-        """Run Codex resume (existing session)."""
-        full_command = ["codex", "exec", "--skip-git-repo-check"]
-
-        if working_directory:
-            full_command.extend(["--cd", working_directory])
-        if enable_search:
-            full_command.append("--search")
-
-        if BYPASS_APPROVALS:
-            full_command.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
-            full_command.append("--full-auto")
-
-        full_command.append("resume")
-        if session_ref == "--last":
-            full_command.append("--last")
-        else:
-            full_command.append(session_ref)
-        full_command.append("-")
-
-        await self.run_command(
-            task=task,
-            command=full_command,
-            prompt=prompt,
-            output_cleaner=clean_codex_output,
-            output_prefix="Codex Resume Output",
-            not_found_hint="Please ensure Codex CLI is installed and in your PATH.",
-        )
-
-    # === Gemini Runners ===
-
-    async def run_gemini_exec(
-        self,
-        task: Task,
-        prompt: str,
-        working_directory: str | None = None,
-        stream: bool = True,
-    ):
-        """Run Gemini CLI (new session)."""
-        full_command = ["gemini"]
-
-        if GEMINI_YOLO_MODE:
-            full_command.extend(["--approval-mode", "yolo"])
-
-        if working_directory:
-            full_command.extend(["--include-directories", working_directory])
-
-        full_command.append(prompt)
-
-        await self.run_command(
-            task=task,
-            command=full_command,
-            prompt="",
-            output_cleaner=clean_gemini_output,
-            output_prefix="Gemini Output",
-            cwd=working_directory,
-            not_found_hint="Please ensure Gemini CLI is installed (npm install -g @google/gemini-cli).",
-            stream=stream,
-        )
-
-    async def run_gemini_resume(
-        self,
-        task: Task,
-        session_ref: str,
-        prompt: str,
-        working_directory: str | None = None,
-    ):
-        """Run Gemini resume (existing session)."""
-        full_command = ["gemini"]
-
-        if GEMINI_YOLO_MODE:
-            full_command.extend(["--approval-mode", "yolo"])
-
-        if working_directory:
-            full_command.extend(["--include-directories", working_directory])
-
-        full_command.extend(["-r", session_ref])
-        full_command.append(prompt)
-
-        await self.run_command(
-            task=task,
-            command=full_command,
-            prompt="",
-            output_cleaner=clean_gemini_output,
-            output_prefix="Gemini Resume Output",
-            cwd=working_directory,
-            not_found_hint="Please ensure Gemini CLI is installed (npm install -g @google/gemini-cli).",
-        )
+        # Apply output cleaner to result
+        if task.result and task.status == "completed":
+            prefix = f"{agent_cmd.output_prefix}:\n\n"
+            if task.result.startswith(prefix):
+                content = task.result[len(prefix):]
+                cleaner = runner.get_output_cleaner()
+                cleaned = cleaner(content, prompt)
+                task.result = f"{prefix}{cleaned}"
 
 
 # Global engine instance
 engine = TaskEngine()
+
+# Re-export DEFAULT_TIMEOUT for backward compatibility
+DEFAULT_TIMEOUT = config.default_timeout

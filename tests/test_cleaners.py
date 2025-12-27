@@ -3,7 +3,8 @@ Tests for output cleaning functions.
 """
 
 import pytest
-from owlex.engine import clean_codex_output, clean_gemini_output
+from owlex.agents.codex import clean_codex_output
+from owlex.agents.gemini import clean_gemini_output
 
 
 class TestCleanCodexOutput:

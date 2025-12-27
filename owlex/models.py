@@ -20,6 +20,16 @@ class TaskStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class ErrorCode(str, Enum):
+    """Standard error codes for programmatic error handling."""
+    INVALID_ARGS = "INVALID_ARGS"
+    NOT_FOUND = "NOT_FOUND"
+    TIMEOUT = "TIMEOUT"
+    EXECUTION_FAILED = "EXECUTION_FAILED"
+    CANCELLED = "CANCELLED"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+
 class Agent(str, Enum):
     """Available AI agents."""
     CODEX = "codex"
@@ -38,6 +48,7 @@ class Task:
     completion_time: datetime | None = None
     result: str | None = None
     error: str | None = None
+    warnings: str | None = None  # stderr output captured even on success
     async_task: asyncio.Task | None = field(default=None, repr=False)
     process: asyncio.subprocess.Process | None = field(default=None, repr=False)
     # Streaming support
@@ -61,7 +72,9 @@ class TaskResponse(BaseModel):
     status: str | None = None
     message: str | None = None
     content: str | None = None
+    warnings: str | None = None  # stderr captured even on success
     error: str | None = None
+    error_code: str | None = None  # Standard error code for programmatic handling
     duration_seconds: float | None = None
 
 
@@ -91,7 +104,7 @@ class CouncilMetadata(BaseModel):
     """Metadata for council session."""
     total_duration_seconds: float
     rounds: int
-    log: list[str] = []  # Progress log entries
+    log: list[str] = Field(default_factory=list)  # Progress log entries
 
 
 class CouncilResponse(BaseModel):
@@ -99,6 +112,7 @@ class CouncilResponse(BaseModel):
     prompt: str
     working_directory: str | None = None
     deliberation: bool
+    critique: bool = False  # If true, round 2 used critique mode instead of revision
     claude_opinion: ClaudeOpinion | None = None
     round_1: CouncilRound
     round_2: CouncilRound | None = None
