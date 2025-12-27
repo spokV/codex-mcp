@@ -5,6 +5,7 @@ Allows Claude Code to start/resume sessions with Codex or Gemini for advice
 """
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -12,6 +13,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP, Context
@@ -44,6 +46,9 @@ class Task:
     error: str | None = None
     async_task: asyncio.Task | None = field(default=None, repr=False)
     process: asyncio.subprocess.Process | None = field(default=None, repr=False)
+    # Streaming support
+    output_lines: list[str] = field(default_factory=list)
+    stream_complete: bool = False
 
 
 # Global task storage
@@ -128,6 +133,32 @@ def clean_gemini_output(raw_output: str, original_prompt: str = "") -> str:
     return cleaned.strip()
 
 
+async def _read_stream_lines(
+    stream: asyncio.StreamReader,
+    task: Task,
+    stream_name: str,
+) -> str:
+    """Read stream line-by-line, storing lines and emitting notifications."""
+    lines = []
+    while True:
+        try:
+            line = await stream.readline()
+            if not line:
+                break
+            decoded = line.decode('utf-8', errors='replace').rstrip('\n\r')
+            lines.append(decoded)
+            task.output_lines.append(f"[{stream_name}] {decoded}")
+            # Emit real-time notification if context available
+            if task.context:
+                try:
+                    await task.context.info(f"[{task.task_id[:8]}] {decoded}")
+                except Exception:
+                    pass  # Don't fail on notification errors
+        except Exception:
+            break
+    return '\n'.join(lines)
+
+
 async def _run_command_task(
     task_id: str,
     command: list[str],
@@ -137,16 +168,20 @@ async def _run_command_task(
     cwd: str | None = None,
     timeout: int = DEFAULT_TIMEOUT,
     not_found_hint: str | None = None,
+    stream: bool = False,
 ):
     """
     Generic helper to run a subprocess command for a task.
     Handles process creation, timeouts, output cleaning, and status updates.
+
+    If stream=True, reads stdout/stderr line-by-line with real-time notifications.
     """
     task = tasks[task_id]
-    
+
     try:
         task.status = "running"
-        stdin_input = prompt.encode('utf-8')
+        task.output_lines = []
+        task.stream_complete = False
 
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -158,22 +193,58 @@ async def _run_command_task(
 
         task.process = process
 
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=stdin_input),
-                timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            task.status = "failed"
-            task.error = f"{command[0]} command timed out after {timeout} seconds"
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-            return
+        # Write stdin if provided
+        if prompt:
+            process.stdin.write(prompt.encode('utf-8'))
+            await process.stdin.drain()
+        process.stdin.close()
 
-        stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
-        stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
+        if stream:
+            # Streaming mode: read line-by-line with notifications
+            try:
+                async def read_with_timeout():
+                    stdout_task = asyncio.create_task(
+                        _read_stream_lines(process.stdout, task, "stdout")
+                    )
+                    stderr_task = asyncio.create_task(
+                        _read_stream_lines(process.stderr, task, "stderr")
+                    )
+                    stdout_text, stderr_text = await asyncio.gather(stdout_task, stderr_task)
+                    await process.wait()
+                    return stdout_text, stderr_text
+
+                stdout_text, stderr_text = await asyncio.wait_for(
+                    read_with_timeout(),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                task.status = "failed"
+                task.error = f"{command[0]} command timed out after {timeout} seconds"
+                task.completion_time = datetime.now()
+                task.stream_complete = True
+                await _emit_task_notification(task)
+                return
+        else:
+            # Buffered mode: use communicate()
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(input=prompt.encode('utf-8') if prompt else None),
+                    timeout=timeout
+                )
+                stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
+                stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                task.status = "failed"
+                task.error = f"{command[0]} command timed out after {timeout} seconds"
+                task.completion_time = datetime.now()
+                await _emit_task_notification(task)
+                return
+
+        task.stream_complete = True
 
         if process.returncode == 0:
             cleaned_output = output_cleaner(stdout_text, prompt)
@@ -195,6 +266,7 @@ async def _run_command_task(
     except asyncio.CancelledError:
         task.status = "cancelled"
         task.completion_time = datetime.now()
+        task.stream_complete = True
         if task.process:
             try:
                 task.process.kill()
@@ -213,12 +285,14 @@ async def _run_command_task(
             task.error = f"Error: {e}"
         task.status = "failed"
         task.completion_time = datetime.now()
+        task.stream_complete = True
         await _emit_task_notification(task)
 
     except Exception as e:
         task.status = "failed"
         task.error = f"Error executing {command[0]}: {str(e)}"
         task.completion_time = datetime.now()
+        task.stream_complete = True
         await _emit_task_notification(task)
 
 
@@ -266,7 +340,8 @@ async def _run_codex_exec(
     task_id: str,
     prompt: str,
     working_directory: str | None = None,
-    enable_search: bool = False
+    enable_search: bool = False,
+    stream: bool = True,
 ):
     """Background coroutine that runs Codex exec (new session) and updates task status"""
     # Build command: codex exec [options] -
@@ -291,6 +366,7 @@ async def _run_codex_exec(
         output_cleaner=clean_codex_output,
         output_prefix="Codex Output",
         not_found_hint="Please ensure Codex CLI is installed and in your PATH.",
+        stream=stream,
     )
 
 
@@ -298,6 +374,7 @@ async def _run_gemini_exec(
     task_id: str,
     prompt: str,
     working_directory: str | None = None,
+    stream: bool = True,
 ):
     """Background coroutine that runs Gemini CLI (new session) and updates task status"""
     # Build command: gemini [options] "prompt"
@@ -319,6 +396,7 @@ async def _run_gemini_exec(
         output_prefix="Gemini Output",
         cwd=working_directory,
         not_found_hint="Please ensure Gemini CLI is installed (npm install -g @google/gemini-cli).",
+        stream=stream,
     )
 
 
@@ -576,12 +654,43 @@ async def wait_for_task(task_id: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     return f"Task {task.status}: {task.error or ''}"
 
 
+def _extract_content(result: str | None, prefix: str) -> str:
+    """Extract raw content from task result, stripping the prefix."""
+    if not result:
+        return ""
+    # Strip prefix like "Codex Output:\n\n" or "Gemini Output:\n\n"
+    if result.startswith(prefix):
+        return result[len(prefix):].strip()
+    return result.strip()
+
+
+def _build_agent_response(task: Task, agent: str) -> dict[str, Any]:
+    """Build structured response for an agent."""
+    prefix_map = {
+        "codex": "Codex Output:\n\n",
+        "gemini": "Gemini Output:\n\n",
+    }
+    prefix = prefix_map.get(agent, "")
+
+    return {
+        "agent": agent,
+        "status": task.status,
+        "content": _extract_content(task.result, prefix) if task.status == "completed" else None,
+        "error": task.error if task.status == "failed" else None,
+        "duration_seconds": (
+            (task.completion_time - task.start_time).total_seconds()
+            if task.completion_time else None
+        ),
+        "task_id": task.task_id,
+    }
+
+
 @mcp.tool()
 async def council_ask(
     ctx: Context[ServerSession, None],
     prompt: str = Field(description="The question or task to send to the council"),
     working_directory: str | None = Field(default=None, description="Working directory for context"),
-    deliberate: bool = Field(default=False, description="If true, share answers between agents for a second round of deliberation"),
+    deliberate: bool = Field(default=True, description="If true, share answers between agents for a second round of deliberation"),
     timeout: int = Field(default=DEFAULT_TIMEOUT, description="Timeout per agent in seconds"),
 ) -> str:
     """
@@ -594,15 +703,15 @@ async def council_ask(
     round, allowing them to revise their opinions after seeing others' responses.
     """
     if not prompt or not prompt.strip():
-        return "Error: 'prompt' parameter is required."
+        return json.dumps({"error": "'prompt' parameter is required."})
 
     if working_directory:
         working_directory = os.path.expanduser(working_directory)
         if not os.path.isdir(working_directory):
-            return f"Error: working_directory '{working_directory}' does not exist."
+            return json.dumps({"error": f"working_directory '{working_directory}' does not exist."})
 
     prompt = prompt.strip()
-    results = {}
+    council_start = datetime.now()
 
     # === Round 1: Parallel initial queries ===
     await ctx.info("[council] Starting round 1: querying Codex and Gemini in parallel...")
@@ -631,7 +740,7 @@ async def council_ask(
     tasks[codex_task_id] = codex_task
     tasks[gemini_task_id] = gemini_task
 
-    # Start both in parallel
+    # Start both in parallel with streaming enabled
     codex_task.async_task = asyncio.create_task(_run_codex_exec(
         codex_task_id, prompt, working_directory, enable_search=False
     ))
@@ -646,20 +755,26 @@ async def council_ask(
         return_exceptions=True
     )
 
-    # Collect results
-    codex_result = codex_task.result if codex_task.status == "completed" else f"[Error: {codex_task.error}]"
-    gemini_result = gemini_task.result if gemini_task.status == "completed" else f"[Error: {gemini_task.error}]"
-
-    results["round1"] = {
-        "codex": codex_result,
-        "gemini": gemini_result
-    }
-
     await ctx.info("[council] Round 1 complete.")
+
+    # Build structured response
+    response: dict[str, Any] = {
+        "prompt": prompt,
+        "working_directory": working_directory,
+        "deliberation": deliberate,
+        "round_1": {
+            "codex": _build_agent_response(codex_task, "codex"),
+            "gemini": _build_agent_response(gemini_task, "gemini"),
+        },
+    }
 
     # === Round 2: Deliberation (optional) ===
     if deliberate:
         await ctx.info("[council] Starting round 2: deliberation phase...")
+
+        # Get content for deliberation prompt
+        codex_content = response["round_1"]["codex"]["content"] or response["round_1"]["codex"]["error"] or "(no response)"
+        gemini_content = response["round_1"]["gemini"]["content"] or response["round_1"]["gemini"]["error"] or "(no response)"
 
         deliberation_prompt = f"""You previously answered a question. Now review all council members' answers and provide your revised opinion.
 
@@ -667,10 +782,10 @@ ORIGINAL QUESTION:
 {prompt}
 
 CODEX'S ANSWER:
-{codex_result}
+{codex_content}
 
 GEMINI'S ANSWER:
-{gemini_result}
+{gemini_content}
 
 Please provide your revised answer after considering the other perspectives. Note any points of agreement or disagreement."""
 
@@ -712,45 +827,20 @@ Please provide your revised answer after considering the other perspectives. Not
             return_exceptions=True
         )
 
-        codex_delib_result = codex_delib_task.result if codex_delib_task.status == "completed" else f"[Error: {codex_delib_task.error}]"
-        gemini_delib_result = gemini_delib_task.result if gemini_delib_task.status == "completed" else f"[Error: {gemini_delib_task.error}]"
-
-        results["round2"] = {
-            "codex": codex_delib_result,
-            "gemini": gemini_delib_result
-        }
-
         await ctx.info("[council] Round 2 complete.")
 
-    # === Format output ===
-    output = ["# Council Responses", ""]
-    output.append("## Original Question")
-    output.append(prompt)
-    output.append("")
+        response["round_2"] = {
+            "codex": _build_agent_response(codex_delib_task, "codex"),
+            "gemini": _build_agent_response(gemini_delib_task, "gemini"),
+        }
 
-    output.append("## Round 1: Initial Answers")
-    output.append("")
-    output.append("### Codex")
-    output.append(results["round1"]["codex"] or "(no response)")
-    output.append("")
-    output.append("### Gemini")
-    output.append(results["round1"]["gemini"] or "(no response)")
-    output.append("")
+    # Add metadata
+    response["metadata"] = {
+        "total_duration_seconds": (datetime.now() - council_start).total_seconds(),
+        "rounds": 2 if deliberate else 1,
+    }
 
-    if deliberate and "round2" in results:
-        output.append("## Round 2: After Deliberation")
-        output.append("")
-        output.append("### Codex (revised)")
-        output.append(results["round2"]["codex"] or "(no response)")
-        output.append("")
-        output.append("### Gemini (revised)")
-        output.append(results["round2"]["gemini"] or "(no response)")
-        output.append("")
-
-    output.append("---")
-    output.append("*Please synthesize the above responses into a final answer.*")
-
-    return "\n".join(output)
+    return json.dumps(response, indent=2, default=str)
 
 
 def main():
