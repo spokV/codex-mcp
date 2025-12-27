@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "owlex"
-version = "0.1.0"
-description = "MCP server for Codex CLI integration with Claude Code"
+version = "0.2.0"
+description = "MCP server for Codex CLI and Gemini CLI integration with Claude Code"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MCP Server for Codex CLI Integration
-Allows Claude Code to resume Codex sessions for advice
+MCP Server for Codex CLI and Gemini CLI Integration
+Allows Claude Code to start/resume sessions with Codex or Gemini for advice
 """
 
 import asyncio
@@ -17,9 +17,13 @@ from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.session import ServerSession
 
 
-# Configuration
+# Configuration - Codex
 BYPASS_APPROVALS = os.environ.get("CODEX_BYPASS_APPROVALS", "false").lower() == "true"
 CLEAN_OUTPUT = os.environ.get("CODEX_CLEAN_OUTPUT", "true").lower() == "true"
+
+# Configuration - Gemini
+GEMINI_YOLO_MODE = os.environ.get("GEMINI_YOLO_MODE", "true").lower() == "true"
+GEMINI_CLEAN_OUTPUT = os.environ.get("GEMINI_CLEAN_OUTPUT", "true").lower() == "true"
 
 
 @dataclass
@@ -303,6 +307,210 @@ async def _run_codex_exec(
         await _emit_task_notification(task)
 
 
+def clean_gemini_output(raw_output: str, original_prompt: str = "") -> str:
+    """Clean Gemini CLI output by removing noise."""
+    if not GEMINI_CLEAN_OUTPUT:
+        return raw_output
+    cleaned = raw_output
+    # Remove YOLO mode warning if present
+    if cleaned.startswith("YOLO mode is enabled."):
+        lines = cleaned.split('\n', 2)
+        if len(lines) > 2:
+            cleaned = lines[2]
+        elif len(lines) > 1:
+            cleaned = lines[1]
+    # Remove "Loaded cached credentials." line
+    cleaned = re.sub(r'^Loaded cached credentials\.\n?', '', cleaned, flags=re.MULTILINE)
+    # Collapse triple+ newlines
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+
+async def _run_gemini_exec(
+    task_id: str,
+    prompt: str,
+    working_directory: str | None = None,
+):
+    """Background coroutine that runs Gemini CLI (new session) and updates task status"""
+    task = tasks[task_id]
+
+    try:
+        task.status = "running"
+
+        # Build command: gemini [options] "prompt"
+        full_command = ["gemini"]
+
+        if GEMINI_YOLO_MODE:
+            full_command.extend(["--approval-mode", "yolo"])
+
+        if working_directory:
+            full_command.extend(["--include-directories", working_directory])
+
+        full_command.append(prompt)
+
+        process = await asyncio.create_subprocess_exec(
+            *full_command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_directory
+        )
+
+        task.process = process
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=300
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            task.status = "failed"
+            task.error = "Gemini exec timed out after 300 seconds"
+            task.completion_time = datetime.now()
+            await _emit_task_notification(task)
+            return
+
+        stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
+        stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
+
+        if process.returncode == 0:
+            cleaned_output = clean_gemini_output(stdout_text, prompt)
+            task.result = f"Gemini Output:\n\n{cleaned_output}"
+            task.status = "completed"
+            task.completion_time = datetime.now()
+            await _emit_task_notification(task)
+        else:
+            error_output = []
+            if stdout_text.strip():
+                error_output.append(f"stdout:\n{stdout_text}")
+            if stderr_text.strip():
+                error_output.append(f"stderr:\n{stderr_text}")
+            task.status = "failed"
+            task.error = f"Gemini exec failed (exit code {process.returncode}):\n\n" + ("\n\n".join(error_output) or "No output")
+            task.completion_time = datetime.now()
+            await _emit_task_notification(task)
+
+    except asyncio.CancelledError:
+        task.status = "cancelled"
+        task.completion_time = datetime.now()
+        if task.process:
+            try:
+                task.process.kill()
+                await task.process.wait()
+            except:
+                pass
+        await _emit_task_notification(task)
+        raise
+
+    except FileNotFoundError as e:
+        task.error = "Error: 'gemini' command not found. Please ensure Gemini CLI is installed (brew install gemini-cli)." if e.filename == "gemini" else f"Error: {e}"
+        task.status = "failed"
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+
+    except Exception as e:
+        task.status = "failed"
+        task.error = f"Error executing Gemini: {str(e)}"
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+
+
+async def _run_gemini_resume(
+    task_id: str,
+    session_ref: str,
+    prompt: str,
+    working_directory: str | None = None,
+):
+    """Background coroutine that runs Gemini resume and updates task status"""
+    task = tasks[task_id]
+
+    try:
+        task.status = "running"
+
+        # Build command: gemini [options] -r <session> "prompt"
+        full_command = ["gemini"]
+
+        if GEMINI_YOLO_MODE:
+            full_command.extend(["--approval-mode", "yolo"])
+
+        if working_directory:
+            full_command.extend(["--include-directories", working_directory])
+
+        # Add resume flag
+        full_command.extend(["-r", session_ref])
+        full_command.append(prompt)
+
+        process = await asyncio.create_subprocess_exec(
+            *full_command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_directory
+        )
+
+        task.process = process
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=300
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            task.status = "failed"
+            task.error = "Gemini resume timed out after 300 seconds"
+            task.completion_time = datetime.now()
+            await _emit_task_notification(task)
+            return
+
+        stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
+        stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
+
+        if process.returncode == 0:
+            cleaned_output = clean_gemini_output(stdout_text, prompt)
+            task.result = f"Gemini Resume Output:\n\n{cleaned_output}"
+            task.status = "completed"
+            task.completion_time = datetime.now()
+            await _emit_task_notification(task)
+        else:
+            error_output = []
+            if stdout_text.strip():
+                error_output.append(f"stdout:\n{stdout_text}")
+            if stderr_text.strip():
+                error_output.append(f"stderr:\n{stderr_text}")
+            task.status = "failed"
+            task.error = f"Gemini resume failed (exit code {process.returncode}):\n\n" + ("\n\n".join(error_output) or "No output")
+            task.completion_time = datetime.now()
+            await _emit_task_notification(task)
+
+    except asyncio.CancelledError:
+        task.status = "cancelled"
+        task.completion_time = datetime.now()
+        if task.process:
+            try:
+                task.process.kill()
+                await task.process.wait()
+            except:
+                pass
+        await _emit_task_notification(task)
+        raise
+
+    except FileNotFoundError as e:
+        task.error = "Error: 'gemini' command not found. Please ensure Gemini CLI is installed (brew install gemini-cli)." if e.filename == "gemini" else f"Error: {e}"
+        task.status = "failed"
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+
+    except Exception as e:
+        task.status = "failed"
+        task.error = f"Error executing Gemini resume: {str(e)}"
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+
+
 @mcp.tool()
 async def start_codex_session(
     ctx: Context[ServerSession, None],
@@ -391,9 +599,87 @@ async def resume_codex_session(
 
 
 @mcp.tool()
+async def start_gemini_session(
+    ctx: Context[ServerSession, None],
+    prompt: str = Field(description="The question or request to send"),
+    working_directory: str | None = Field(default=None, description="Working directory for Gemini context"),
+) -> str:
+    """Start a new Gemini CLI session (no prior context)."""
+    if not prompt or not prompt.strip():
+        return "Error: 'prompt' parameter is required."
+
+    if working_directory:
+        working_directory = os.path.expanduser(working_directory)
+        if not os.path.isdir(working_directory):
+            return f"Error: working_directory '{working_directory}' does not exist or is not a directory."
+
+    task_id = str(uuid.uuid4())
+    task = Task(
+        task_id=task_id,
+        status="pending",
+        command="gemini_exec",
+        args={
+            "prompt": prompt.strip(),
+            "working_directory": working_directory,
+        },
+        start_time=datetime.now(),
+        context=ctx
+    )
+
+    tasks[task_id] = task
+
+    task.async_task = asyncio.create_task(_run_gemini_exec(
+        task_id, prompt.strip(),
+        working_directory
+    ))
+
+    return f"Gemini session started. Task ID: {task_id}\n\nUse wait_for_task to get result."
+
+
+@mcp.tool()
+async def resume_gemini_session(
+    ctx: Context[ServerSession, None],
+    prompt: str = Field(description="The question or request to send to the resumed session"),
+    session_ref: str = Field(default="latest", description="Session to resume: 'latest' for most recent, or index number"),
+    working_directory: str | None = Field(default=None, description="Working directory for Gemini context"),
+) -> str:
+    """Resume an existing Gemini CLI session with full conversation history."""
+    if not prompt or not prompt.strip():
+        return "Error: 'prompt' parameter is required."
+
+    if working_directory:
+        working_directory = os.path.expanduser(working_directory)
+        if not os.path.isdir(working_directory):
+            return f"Error: working_directory '{working_directory}' does not exist or is not a directory."
+
+    task_id = str(uuid.uuid4())
+    task = Task(
+        task_id=task_id,
+        status="pending",
+        command="gemini_resume",
+        args={
+            "session_ref": session_ref,
+            "prompt": prompt.strip(),
+            "working_directory": working_directory,
+        },
+        start_time=datetime.now(),
+        context=ctx
+    )
+
+    tasks[task_id] = task
+
+    task.async_task = asyncio.create_task(_run_gemini_resume(
+        task_id, session_ref, prompt.strip(),
+        working_directory
+    ))
+
+    return f"Gemini resume started (session: {session_ref}). Task ID: {task_id}\n\nUse wait_for_task to get result."
+
+
+@mcp.tool()
 async def get_task_result(task_id: str) -> str:
     """
-    Get the result of a Codex task.
+    Get the result of a task (Codex or Gemini).
 
     Args:
         task_id: The task ID returned by resume_codex_session
