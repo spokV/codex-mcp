@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "owlex"
-version = "0.1.1"
+version = "0.1.2"
 description = "MCP server for Codex CLI and Gemini CLI integration with Claude Code"
 license = "MIT"
 readme = "README.md"
