@@ -576,6 +576,183 @@ async def wait_for_task(task_id: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     return f"Task {task.status}: {task.error or ''}"
 
 
+@mcp.tool()
+async def council_ask(
+    ctx: Context[ServerSession, None],
+    prompt: str = Field(description="The question or task to send to the council"),
+    working_directory: str | None = Field(default=None, description="Working directory for context"),
+    deliberate: bool = Field(default=False, description="If true, share answers between agents for a second round of deliberation"),
+    timeout: int = Field(default=DEFAULT_TIMEOUT, description="Timeout per agent in seconds"),
+) -> str:
+    """
+    Ask the council (Codex + Gemini) a question and collect their answers.
+
+    Sends the prompt to both Codex and Gemini in parallel, waits for responses,
+    and returns all answers for the MCP client (Claude Code) to synthesize.
+
+    If deliberate=True, shares all initial answers with each agent for a second
+    round, allowing them to revise their opinions after seeing others' responses.
+    """
+    if not prompt or not prompt.strip():
+        return "Error: 'prompt' parameter is required."
+
+    if working_directory:
+        working_directory = os.path.expanduser(working_directory)
+        if not os.path.isdir(working_directory):
+            return f"Error: working_directory '{working_directory}' does not exist."
+
+    prompt = prompt.strip()
+    results = {}
+
+    # === Round 1: Parallel initial queries ===
+    await ctx.info("[council] Starting round 1: querying Codex and Gemini in parallel...")
+
+    # Create tasks for both agents
+    codex_task_id = str(uuid.uuid4())
+    gemini_task_id = str(uuid.uuid4())
+
+    codex_task = Task(
+        task_id=codex_task_id,
+        status="pending",
+        command="council_codex",
+        args={"prompt": prompt, "working_directory": working_directory},
+        start_time=datetime.now(),
+        context=ctx
+    )
+    gemini_task = Task(
+        task_id=gemini_task_id,
+        status="pending",
+        command="council_gemini",
+        args={"prompt": prompt, "working_directory": working_directory},
+        start_time=datetime.now(),
+        context=ctx
+    )
+
+    tasks[codex_task_id] = codex_task
+    tasks[gemini_task_id] = gemini_task
+
+    # Start both in parallel
+    codex_task.async_task = asyncio.create_task(_run_codex_exec(
+        codex_task_id, prompt, working_directory, enable_search=False
+    ))
+    gemini_task.async_task = asyncio.create_task(_run_gemini_exec(
+        gemini_task_id, prompt, working_directory
+    ))
+
+    # Wait for both to complete
+    await asyncio.gather(
+        asyncio.wait_for(asyncio.shield(codex_task.async_task), timeout=timeout),
+        asyncio.wait_for(asyncio.shield(gemini_task.async_task), timeout=timeout),
+        return_exceptions=True
+    )
+
+    # Collect results
+    codex_result = codex_task.result if codex_task.status == "completed" else f"[Error: {codex_task.error}]"
+    gemini_result = gemini_task.result if gemini_task.status == "completed" else f"[Error: {gemini_task.error}]"
+
+    results["round1"] = {
+        "codex": codex_result,
+        "gemini": gemini_result
+    }
+
+    await ctx.info("[council] Round 1 complete.")
+
+    # === Round 2: Deliberation (optional) ===
+    if deliberate:
+        await ctx.info("[council] Starting round 2: deliberation phase...")
+
+        deliberation_prompt = f"""You previously answered a question. Now review all council members' answers and provide your revised opinion.
+
+ORIGINAL QUESTION:
+{prompt}
+
+CODEX'S ANSWER:
+{codex_result}
+
+GEMINI'S ANSWER:
+{gemini_result}
+
+Please provide your revised answer after considering the other perspectives. Note any points of agreement or disagreement."""
+
+        # Create new tasks for deliberation
+        codex_delib_id = str(uuid.uuid4())
+        gemini_delib_id = str(uuid.uuid4())
+
+        codex_delib_task = Task(
+            task_id=codex_delib_id,
+            status="pending",
+            command="council_codex_delib",
+            args={"prompt": deliberation_prompt, "working_directory": working_directory},
+            start_time=datetime.now(),
+            context=ctx
+        )
+        gemini_delib_task = Task(
+            task_id=gemini_delib_id,
+            status="pending",
+            command="council_gemini_delib",
+            args={"prompt": deliberation_prompt, "working_directory": working_directory},
+            start_time=datetime.now(),
+            context=ctx
+        )
+
+        tasks[codex_delib_id] = codex_delib_task
+        tasks[gemini_delib_id] = gemini_delib_task
+
+        # Start deliberation round in parallel
+        codex_delib_task.async_task = asyncio.create_task(_run_codex_exec(
+            codex_delib_id, deliberation_prompt, working_directory, enable_search=False
+        ))
+        gemini_delib_task.async_task = asyncio.create_task(_run_gemini_exec(
+            gemini_delib_id, deliberation_prompt, working_directory
+        ))
+
+        await asyncio.gather(
+            asyncio.wait_for(asyncio.shield(codex_delib_task.async_task), timeout=timeout),
+            asyncio.wait_for(asyncio.shield(gemini_delib_task.async_task), timeout=timeout),
+            return_exceptions=True
+        )
+
+        codex_delib_result = codex_delib_task.result if codex_delib_task.status == "completed" else f"[Error: {codex_delib_task.error}]"
+        gemini_delib_result = gemini_delib_task.result if gemini_delib_task.status == "completed" else f"[Error: {gemini_delib_task.error}]"
+
+        results["round2"] = {
+            "codex": codex_delib_result,
+            "gemini": gemini_delib_result
+        }
+
+        await ctx.info("[council] Round 2 complete.")
+
+    # === Format output ===
+    output = ["# Council Responses", ""]
+    output.append("## Original Question")
+    output.append(prompt)
+    output.append("")
+
+    output.append("## Round 1: Initial Answers")
+    output.append("")
+    output.append("### Codex")
+    output.append(results["round1"]["codex"] or "(no response)")
+    output.append("")
+    output.append("### Gemini")
+    output.append(results["round1"]["gemini"] or "(no response)")
+    output.append("")
+
+    if deliberate and "round2" in results:
+        output.append("## Round 2: After Deliberation")
+        output.append("")
+        output.append("### Codex (revised)")
+        output.append(results["round2"]["codex"] or "(no response)")
+        output.append("")
+        output.append("### Gemini (revised)")
+        output.append(results["round2"]["gemini"] or "(no response)")
+        output.append("")
+
+    output.append("---")
+    output.append("*Please synthesize the above responses into a final answer.*")
+
+    return "\n".join(output)
+
+
 def main():
     """Entry point for owlex-server command."""
     async def run_with_cleanup():
