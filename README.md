@@ -1,14 +1,15 @@
 # Owlex
 
-MCP server for running Codex CLI and Gemini CLI sessions from Claude Code while maintaining context.
+MCP server for multi-AI provider integration with usage analytics. Access Codex CLI, Gemini CLI, and 500+ API models (via OpenRouter, Kimi, MiniMax, etc.) from Claude Code.
 
 ## Features
 
-- **Multi-AI delegation** - Invoke Codex CLI or Gemini CLI from Claude Code
-- **Fresh or resumed sessions** - Start a new session with fresh context, or resume from the last session with full conversation history preserved
-- **Async task execution** - Tasks run in the background; wait for completion with `wait_for_task` or continue working and check results later with `get_task_result`
-- **Working directory support** - Point Codex/Gemini to any project directory
-- **Web search** - Enable Codex web search for up-to-date information
+- **Multi-AI delegation** - Invoke any AI provider from Claude Code
+- **Plugin system** - Add new API providers via simple config
+- **Usage tracking** - SQLite database tracks tokens, cost, duration
+- **Quality ratings** - Claude auto-rates responses for comparison
+- **Monthly statistics** - View provider performance over time
+- **Statusline integration** - Show available providers in Claude Code
 
 ## When to Use Each Provider
 
@@ -19,8 +20,7 @@ MCP server for running Codex CLI and Gemini CLI sessions from Claude Code while 
 | Complex multi-step implementation | Claude (caller) | Best agentic coding (SWE-bench) |
 | PRD & requirements | Codex | Excellent Socratic questioning |
 | Multimodal tasks (images, video) | Gemini | State-of-the-art multimodal reasoning |
-
-**Tip:** Configure your preferred models in your Claude Code config (`CLAUDE.md`) for project-specific recommendations.
+| Cost-sensitive tasks | OpenRouter | Route to cheapest provider with `:floor` |
 
 ## Installation
 
@@ -30,7 +30,7 @@ uv tool install /path/to/owlex
 
 ## Configuration
 
-Add to your `.mcp.json`:
+Add to your Claude Code MCP config:
 
 ```json
 {
@@ -38,84 +38,204 @@ Add to your `.mcp.json`:
     "owlex": {
       "command": "owlex-server",
       "env": {
-        "CODEX_CLEAN_OUTPUT": "true"
+        "CODEX_CLEAN_OUTPUT": "true",
+        "GEMINI_YOLO_MODE": "true"
       }
     }
   }
 }
 ```
 
+### Adding API Providers
+
+Create `~/.owlex/providers.json`:
+
+```json
+{
+  "kimi": {
+    "type": "openai_api",
+    "base_url": "https://api.moonshot.ai/v1",
+    "api_key_env": "KIMI_API_KEY",
+    "default_model": "kimi-k2-turbo-preview",
+    "cost_per_1k_input": 0.0001,
+    "cost_per_1k_output": 0.0003
+  },
+  "minimax": {
+    "type": "openai_api",
+    "base_url": "https://api.minimax.io/v1",
+    "api_key_env": "MINIMAX_API_KEY",
+    "default_model": "minimax-m2"
+  },
+  "openrouter": {
+    "type": "openrouter",
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key_env": "OPENROUTER_API_KEY",
+    "default_model": "anthropic/claude-sonnet-4",
+    "site_url": "https://github.com/agentic-mcp-tools/owlex",
+    "app_name": "owlex"
+  }
+}
+```
+
+Or use the `add_provider` tool to add providers programmatically.
+
 ## Tools
 
-### Codex CLI Tools
+### Unified Provider Interface
 
-#### `start_codex_session`
+#### `list_providers`
 
-Start a new Codex session (no prior context).
+List all available AI providers with status.
 
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `prompt` | Yes | Question or request to send |
-| `working_directory` | No | Working directory for Codex |
-| `enable_search` | No | Enable web search |
+#### `call_provider`
 
-#### `resume_codex_session`
-
-Resume an existing Codex session to ask for advice.
+Call any configured AI provider.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `prompt` | Yes | Question or request to send |
-| `session_id` | No | Session ID to resume (uses `--last` if omitted) |
-| `working_directory` | No | Working directory for Codex |
-| `enable_search` | No | Enable web search |
+| `provider` | Yes | Provider name (codex, gemini, kimi, openrouter, etc.) |
+| `prompt` | Yes | The prompt to send |
+| `model` | No | Model override (uses default if not specified) |
+| `working_directory` | No | Working directory context |
 
-### Gemini CLI Tools
+#### `rate_response`
 
-#### `start_gemini_session`
-
-Start a new Gemini CLI session (no prior context).
+Rate a provider response for quality tracking.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `prompt` | Yes | Question or request to send |
-| `working_directory` | No | Working directory for Gemini context |
+| `task_id` | Yes | Task ID to rate |
+| `helpfulness` | Yes | Rating 1-5 |
+| `accuracy` | Yes | Rating 1-5 |
+| `completeness` | Yes | Rating 1-5 |
+| `notes` | No | Optional notes |
 
-#### `resume_gemini_session`
+#### `get_provider_stats`
 
-Resume an existing Gemini CLI session with full conversation history.
+Get usage statistics for providers.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `prompt` | Yes | Question or request to send |
-| `session_ref` | No | Session to resume: `latest` (default) or index number |
-| `working_directory` | No | Working directory for Gemini context |
+| `period` | No | `this_month`, `last_month`, `all_time`, or `YYYY-MM` |
+| `provider` | No | Filter by specific provider |
+
+#### `add_provider`
+
+Add a new API provider via MCP tool.
+
+### Legacy CLI Tools (Backward Compatible)
+
+#### `start_codex_session` / `resume_codex_session`
+
+Direct Codex CLI integration (unchanged from v0.2).
+
+#### `start_gemini_session` / `resume_gemini_session`
+
+Direct Gemini CLI integration (unchanged from v0.2).
 
 ### Task Management
 
 #### `wait_for_task`
 
-Wait for a task (Codex or Gemini) to complete and return its result.
-
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `task_id` | Yes | Task ID returned by session tools |
-| `timeout` | No | Maximum seconds to wait (default: 300) |
+Wait for a task to complete and return its result.
 
 #### `get_task_result`
 
-Get the result of a task (Codex or Gemini) without blocking.
+Get the result of a task without blocking.
 
-| Parameter | Required | Description |
-|-----------|----------|-------------|
-| `task_id` | Yes | Task ID returned by session tools |
+## Usage Workflow
+
+```
+1. Claude: call_provider(provider="kimi", prompt="Explain async in Python")
+   → Returns task_id
+
+2. Claude: wait_for_task(task_id)
+   → Returns Kimi's response, usage auto-tracked
+
+3. Claude: rate_response(task_id, helpfulness=4, accuracy=5, completeness=4)
+   → Rating saved
+
+4. Claude: get_provider_stats(period="this_month")
+   → Shows: kimi (10 calls, 50k tokens, 4.3 avg rating, $0.05)
+```
+
+## OpenRouter Special Features
+
+OpenRouter provides access to 500+ models through one API:
+
+- **Model routing**: Use `:nitro` suffix for fastest, `:floor` for cheapest
+- **Example models**: `anthropic/claude-sonnet-4`, `openai/gpt-4o`, `google/gemini-2.0-flash`
+- **Exact costs**: Queries generation stats API for precise billing
+
+## Statusline Integration
+
+Add available providers to your Claude Code statusline:
+
+```bash
+# Install the helper
+chmod +x ~/.local/bin/owlex-status
+
+# Add to statusline (in ~/.claude/settings.json)
+# Append to your statusline command:
+providers=$($HOME/.local/bin/owlex-status)
+echo "... ${providers}"
+```
+
+Output: `[codex,gemini,kimi,openrouter]`
 
 ## Environment Variables
 
 ### Codex Settings
-- `CODEX_CLEAN_OUTPUT`: Remove echoed prompts from output (default: `true`)
-- `CODEX_BYPASS_APPROVALS`: Bypass sandbox mode (default: `false`)
+- `CODEX_CLEAN_OUTPUT`: Remove echoed prompts (default: `true`)
+- `CODEX_SANDBOX_MODE`: Sandbox mode - `read-only` (suggest only), `workspace-write`, or `danger-full-access` (default: `read-only`)
 
 ### Gemini Settings
-- `GEMINI_YOLO_MODE`: Auto-approve actions via `--approval-mode yolo` (default: `true`)
 - `GEMINI_CLEAN_OUTPUT`: Remove noise from output (default: `true`)
+- `GEMINI_SANDBOX_MODE`: Enable sandbox for suggest-only behavior (default: `true`)
+- `GEMINI_APPROVAL_MODE`: Approval mode - `default` (prompt), `auto_edit`, or `yolo` (default: `default`)
+
+### API Keys
+
+Create a `.env` file in `~/.owlex/` with your API keys:
+
+```bash
+# Copy the example and edit
+cp .env.example ~/.owlex/.env
+
+# Or create manually
+cat > ~/.owlex/.env << 'EOF'
+OPENROUTER_API_KEY=sk-or-v1-...
+KIMI_API_KEY=sk-...
+MINIMAX_API_KEY=...
+DEEPSEEK_API_KEY=sk-...
+EOF
+```
+
+Available keys:
+- `OPENROUTER_API_KEY`: [OpenRouter](https://openrouter.ai/keys) - 500+ models
+- `KIMI_API_KEY`: [Kimi/Moonshot](https://platform.moonshot.cn/)
+- `MINIMAX_API_KEY`: [MiniMax](https://platform.minimax.chat/)
+- `DEEPSEEK_API_KEY`: [DeepSeek](https://platform.deepseek.com/)
+
+## Data Storage
+
+- **API keys**: `~/.owlex/.env`
+- **Provider config**: `~/.owlex/providers.json`
+- **Usage database**: `~/.owlex/usage.db` (SQLite)
+
+## Architecture
+
+```
+owlex/
+├── server.py           # MCP server with all tools
+├── providers/
+│   ├── protocol.py     # Provider interface
+│   ├── codex.py        # Codex CLI provider
+│   ├── gemini.py       # Gemini CLI provider
+│   ├── openai_api.py   # OpenAI-compatible API provider
+│   ├── openrouter.py   # OpenRouter provider
+│   └── registry.py     # Provider discovery
+└── storage/
+    ├── schema.py       # SQLite schema
+    └── usage.py        # Usage tracking
+```

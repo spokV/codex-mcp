@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MCP Server for Codex CLI and Gemini CLI Integration
-Allows Claude Code to start/resume sessions with Codex or Gemini for advice
+MCP Server for Multi-AI Provider Integration with Analytics
+Supports CLI providers (Codex, Gemini) and API providers (Kimi, MiniMax, OpenRouter)
 """
 
 import asyncio
@@ -11,19 +11,41 @@ import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.session import ServerSession
 
+# Load .env file from ~/.owlex/.env or current directory
+_env_paths = [
+    Path.home() / ".owlex" / ".env",
+    Path.cwd() / ".env",
+]
+for _env_path in _env_paths:
+    if _env_path.exists():
+        load_dotenv(_env_path)
+        break
+
+# Import providers and storage
+from .providers.registry import registry
+from .providers.protocol import ProviderResult
+from .storage import usage as usage_db
+from .storage.schema import init_database
+
 
 # Configuration - Codex
-BYPASS_APPROVALS = os.environ.get("CODEX_BYPASS_APPROVALS", "false").lower() == "true"
-CLEAN_OUTPUT = os.environ.get("CODEX_CLEAN_OUTPUT", "true").lower() == "true"
+CODEX_CLEAN_OUTPUT = os.environ.get("CODEX_CLEAN_OUTPUT", "true").lower() == "true"
+# Sandbox mode: read-only (suggest only), workspace-write, or danger-full-access
+CODEX_SANDBOX_MODE = os.environ.get("CODEX_SANDBOX_MODE", "read-only")
 
 # Configuration - Gemini
-GEMINI_YOLO_MODE = os.environ.get("GEMINI_YOLO_MODE", "true").lower() == "true"
 GEMINI_CLEAN_OUTPUT = os.environ.get("GEMINI_CLEAN_OUTPUT", "true").lower() == "true"
+# Sandbox mode: default is enabled (suggest only)
+GEMINI_SANDBOX_MODE = os.environ.get("GEMINI_SANDBOX_MODE", "true").lower() == "true"
+# Approval mode: default, auto_edit, or yolo
+GEMINI_APPROVAL_MODE = os.environ.get("GEMINI_APPROVAL_MODE", "default")
 
 
 @dataclass
@@ -96,7 +118,7 @@ mcp = FastMCP("owlex-server")
 
 def clean_codex_output(raw_output: str, original_prompt: str = "") -> str:
     """Clean Codex CLI output by removing echoed prompt templates."""
-    if not CLEAN_OUTPUT:
+    if not CODEX_CLEAN_OUTPUT:
         return raw_output
     cleaned = raw_output
     if original_prompt and cleaned.startswith(original_prompt):
@@ -127,10 +149,8 @@ async def _run_codex_resume(
         if enable_search:
             full_command.append("--search")
 
-        if BYPASS_APPROVALS:
-            full_command.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
-            full_command.append("--full-auto")
+        # Use sandbox mode (defaults to read-only for suggest-only behavior)
+        full_command.extend(["--sandbox", CODEX_SANDBOX_MODE])
 
         # Add resume subcommand
         full_command.append("resume")
@@ -230,10 +250,8 @@ async def _run_codex_exec(
         if enable_search:
             full_command.append("--search")
 
-        if BYPASS_APPROVALS:
-            full_command.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
-            full_command.append("--full-auto")
+        # Use sandbox mode (defaults to read-only for suggest-only behavior)
+        full_command.extend(["--sandbox", CODEX_SANDBOX_MODE])
 
         full_command.append("-")  # Read prompt from stdin
 
@@ -340,8 +358,13 @@ async def _run_gemini_exec(
         # Build command: gemini [options] "prompt"
         full_command = ["gemini"]
 
-        if GEMINI_YOLO_MODE:
-            full_command.extend(["--approval-mode", "yolo"])
+        # Sandbox mode for suggest-only behavior (default: enabled)
+        if GEMINI_SANDBOX_MODE:
+            full_command.append("--sandbox")
+
+        # Approval mode: default (prompt), auto_edit, or yolo
+        if GEMINI_APPROVAL_MODE != "default":
+            full_command.extend(["--approval-mode", GEMINI_APPROVAL_MODE])
 
         if working_directory:
             full_command.extend(["--include-directories", working_directory])
@@ -432,8 +455,13 @@ async def _run_gemini_resume(
         # Build command: gemini [options] -r <session> "prompt"
         full_command = ["gemini"]
 
-        if GEMINI_YOLO_MODE:
-            full_command.extend(["--approval-mode", "yolo"])
+        # Sandbox mode for suggest-only behavior (default: enabled)
+        if GEMINI_SANDBOX_MODE:
+            full_command.append("--sandbox")
+
+        # Approval mode: default (prompt), auto_edit, or yolo
+        if GEMINI_APPROVAL_MODE != "default":
+            full_command.extend(["--approval-mode", GEMINI_APPROVAL_MODE])
 
         if working_directory:
             full_command.extend(["--include-directories", working_directory])
@@ -734,9 +762,293 @@ async def wait_for_task(task_id: str, timeout: int = 300) -> str:
     return f"Task {task.status}: {task.error or ''}"
 
 
+# =============================================================================
+# New Marketplace Tools
+# =============================================================================
+
+
+async def _run_provider_call(
+    task_id: str,
+    provider_name: str,
+    prompt: str,
+    model: str | None = None,
+    working_directory: str | None = None,
+):
+    """Background task to run a provider call with usage tracking."""
+    task = tasks[task_id]
+    provider = registry.get_provider(provider_name)
+
+    if not provider:
+        task.status = "failed"
+        task.error = f"Provider '{provider_name}' not found"
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+        return
+
+    try:
+        task.status = "running"
+
+        # Call the provider
+        result: ProviderResult = await provider.call(
+            prompt=prompt,
+            model=model,
+            working_directory=working_directory,
+        )
+
+        # Record usage
+        await usage_db.record_usage(
+            task_id=task_id,
+            provider_name=result.provider_name,
+            model_name=result.model_name,
+            provider_type=provider.provider_type,
+            status="completed",
+            prompt=prompt,
+            working_directory=working_directory,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            total_tokens=result.total_tokens,
+            estimated_cost=result.cost,
+            duration_seconds=result.duration_seconds,
+            generation_id=result.generation_id,
+        )
+
+        task.result = f"{result.provider_name} ({result.model_name}) Output:\n\n{result.content}"
+        task.status = "completed"
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+
+    except TimeoutError as e:
+        await usage_db.record_usage(
+            task_id=task_id,
+            provider_name=provider_name,
+            model_name=model or "unknown",
+            provider_type=provider.provider_type,
+            status="timeout",
+            prompt=prompt,
+            error_message=str(e),
+        )
+        task.status = "failed"
+        task.error = str(e)
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+
+    except Exception as e:
+        await usage_db.record_usage(
+            task_id=task_id,
+            provider_name=provider_name,
+            model_name=model or "unknown",
+            provider_type=provider.provider_type,
+            status="failed",
+            prompt=prompt,
+            error_message=str(e),
+        )
+        task.status = "failed"
+        task.error = f"Error: {str(e)}"
+        task.completion_time = datetime.now()
+        await _emit_task_notification(task)
+
+
+@mcp.tool()
+async def list_providers(ctx: Context[ServerSession, None]) -> str:
+    """
+    List all available AI providers.
+
+    Returns providers configured in ~/.owlex/providers.json plus built-in
+    providers (codex, gemini).
+    """
+    registry.initialize()
+    providers = registry.list_all()
+
+    lines = ["Available providers:\n"]
+    for p in providers:
+        status = "ready" if p["available"] else "not configured"
+        model_info = f" [{p['model']}]" if p.get("model") else ""
+        lines.append(f"  - {p['name']} ({p['type']}){model_info}: {status}")
+
+    lines.append("\nTo add a new provider, edit ~/.owlex/providers.json")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def call_provider(
+    ctx: Context[ServerSession, None],
+    provider: str = Field(description="Provider name (codex, gemini, kimi, minimax, openrouter, etc.)"),
+    prompt: str = Field(description="The prompt to send"),
+    model: str | None = Field(default=None, description="Model override (uses default if not specified)"),
+    working_directory: str | None = Field(default=None, description="Working directory context"),
+) -> str:
+    """
+    Call any configured AI provider.
+
+    Supports both CLI-based (codex, gemini) and API-based (kimi, minimax, openrouter) providers.
+    Usage is automatically tracked in ~/.owlex/usage.db.
+
+    After receiving the response, you should rate it using rate_response.
+    """
+    registry.initialize()
+
+    if not prompt or not prompt.strip():
+        return "Error: 'prompt' parameter is required."
+
+    provider_instance = registry.get_provider(provider)
+    if not provider_instance:
+        available = ", ".join(registry.list_available())
+        return f"Error: Provider '{provider}' not found. Available: {available}"
+
+    if not provider_instance.is_available:
+        return f"Error: Provider '{provider}' is not configured. Check API key or CLI installation."
+
+    if working_directory:
+        working_directory = os.path.expanduser(working_directory)
+        if not os.path.isdir(working_directory):
+            return f"Error: working_directory '{working_directory}' does not exist."
+
+    task_id = str(uuid.uuid4())
+    task = Task(
+        task_id=task_id,
+        status="pending",
+        command="call_provider",
+        args={"provider": provider, "prompt": prompt[:200], "model": model},
+        start_time=datetime.now(),
+        context=ctx,
+    )
+    tasks[task_id] = task
+
+    task.async_task = asyncio.create_task(
+        _run_provider_call(task_id, provider, prompt.strip(), model, working_directory)
+    )
+
+    return f"Provider call started ({provider}). Task ID: {task_id}\n\nUse wait_for_task to get result, then rate_response to rate quality."
+
+
+@mcp.tool()
+async def rate_response(
+    ctx: Context[ServerSession, None],
+    task_id: str = Field(description="Task ID to rate"),
+    helpfulness: int = Field(description="Helpfulness rating (1-5)"),
+    accuracy: int = Field(description="Accuracy rating (1-5)"),
+    completeness: int = Field(description="Completeness rating (1-5)"),
+    notes: str | None = Field(default=None, description="Optional notes about the rating"),
+) -> str:
+    """
+    Rate a provider response for quality tracking.
+
+    Claude should call this after evaluating a response from any provider.
+    Ratings are stored and used for provider comparison in get_provider_stats.
+
+    Scale: 1=Poor, 2=Below Average, 3=Average, 4=Good, 5=Excellent
+    """
+    if any(r < 1 or r > 5 for r in [helpfulness, accuracy, completeness]):
+        return "Error: All ratings must be between 1 and 5."
+
+    success = await usage_db.record_rating(
+        task_id=task_id,
+        helpfulness=helpfulness,
+        accuracy=accuracy,
+        completeness=completeness,
+        notes=notes,
+    )
+
+    if not success:
+        return f"Error: No usage record found for task_id '{task_id}'. Make sure the task completed."
+
+    overall = (helpfulness + accuracy + completeness) / 3.0
+    return f"Rating saved for task {task_id[:8]}. Overall: {overall:.1f}/5.0"
+
+
+@mcp.tool()
+async def get_provider_stats(
+    ctx: Context[ServerSession, None],
+    period: str = Field(default="this_month", description="Time period: 'this_month', 'last_month', 'all_time', or 'YYYY-MM'"),
+    provider: str | None = Field(default=None, description="Filter by specific provider"),
+) -> str:
+    """
+    Get usage statistics for AI providers.
+
+    Returns:
+    - Calls per provider/model
+    - Total tokens used
+    - Average quality rating
+    - Estimated costs
+    - Success rate
+    """
+    stats = await usage_db.get_provider_stats(period=period, provider=provider)
+
+    if not stats:
+        return f"No usage data found for period: {period}"
+
+    lines = [f"Provider Statistics ({period}):", "=" * 50]
+
+    for s in stats:
+        lines.append(f"\n{s['provider_name']} ({s['model_name']}):")
+        lines.append(f"  Calls: {s['call_count']} ({s['success_count']} successful)")
+        if s['total_tokens']:
+            lines.append(f"  Tokens: {s['total_tokens']:,}")
+        if s['avg_rating']:
+            lines.append(f"  Avg Rating: {s['avg_rating']:.1f}/5.0")
+        else:
+            lines.append("  Avg Rating: Not rated yet")
+        if s['total_cost']:
+            lines.append(f"  Est. Cost: ${s['total_cost']:.4f}")
+        if s['avg_duration']:
+            lines.append(f"  Avg Duration: {s['avg_duration']:.1f}s")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def add_provider(
+    ctx: Context[ServerSession, None],
+    name: str = Field(description="Provider name (e.g., 'kimi', 'deepseek')"),
+    provider_type: str = Field(description="Provider type: 'openai_api' or 'openrouter'"),
+    base_url: str = Field(description="API base URL (e.g., 'https://api.moonshot.ai/v1')"),
+    api_key_env: str = Field(description="Environment variable name for API key (e.g., 'KIMI_API_KEY')"),
+    default_model: str = Field(description="Default model name (e.g., 'kimi-k2-turbo-preview')"),
+    cost_per_1k_input: float | None = Field(default=None, description="Cost per 1k input tokens (USD)"),
+    cost_per_1k_output: float | None = Field(default=None, description="Cost per 1k output tokens (USD)"),
+    site_url: str | None = Field(default=None, description="For OpenRouter: Site URL (HTTP-Referer header)"),
+    app_name: str | None = Field(default=None, description="For OpenRouter: App name (X-Title header)"),
+) -> str:
+    """
+    Add a new API provider to ~/.owlex/providers.json.
+
+    Example:
+    - name: "kimi"
+    - provider_type: "openai_api"
+    - base_url: "https://api.moonshot.ai/v1"
+    - api_key_env: "KIMI_API_KEY"
+    - default_model: "kimi-k2-turbo-preview"
+    """
+    success = registry.add_provider(
+        name=name,
+        provider_type=provider_type,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        default_model=default_model,
+        cost_per_1k_input=cost_per_1k_input,
+        cost_per_1k_output=cost_per_1k_output,
+        site_url=site_url,
+        app_name=app_name,
+    )
+
+    if success:
+        # Check if API key is set
+        provider = registry.get_provider(name)
+        if provider and provider.is_available:
+            return f"Provider '{name}' added and ready. Use call_provider(provider='{name}', ...) to test."
+        else:
+            return f"Provider '{name}' added but API key not found. Set {api_key_env} in your environment."
+    else:
+        return f"Failed to add provider '{name}'."
+
+
 def main():
     """Entry point for owlex-server command."""
     async def run_with_cleanup():
+        # Initialize database and registry
+        await init_database()
+        registry.initialize()
+
         cleanup_task = asyncio.create_task(cleanup_old_tasks())
         try:
             await mcp.run_stdio_async()

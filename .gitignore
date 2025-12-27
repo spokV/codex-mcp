@@ -29,6 +29,11 @@ Thumbs.db
 .mcp.json
 .claude/
 
+# Environment variables (API keys)
+.env
+.env.local
+.env.*.local
+
 # uv lock file
 uv.lock
 
