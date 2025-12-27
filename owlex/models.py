@@ -91,6 +91,7 @@ class CouncilMetadata(BaseModel):
     """Metadata for council session."""
     total_duration_seconds: float
     rounds: int
+    log: list[str] = []  # Progress log entries
 
 
 class CouncilResponse(BaseModel):

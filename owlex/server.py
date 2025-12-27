@@ -7,6 +7,7 @@ Allows Claude Code to start/resume sessions with Codex or Gemini for advice
 import asyncio
 import json
 import os
+import sys
 from datetime import datetime
 
 from pydantic import Field
@@ -29,6 +30,11 @@ from .engine import (
 
 # Initialize FastMCP server
 mcp = FastMCP("owlex-server")
+
+
+def _log(msg: str):
+    """Log progress to stderr for CLI visibility."""
+    print(msg, file=sys.stderr, flush=True)
 
 
 def _validate_working_directory(working_directory: str | None) -> tuple[str | None, str | None]:
@@ -328,9 +334,17 @@ async def council_ask(
 
     prompt = prompt.strip()
     council_start = datetime.now()
+    log_entries: list[str] = []
+
+    def log(msg: str):
+        """Add to log and print to stderr."""
+        log_entries.append(msg)
+        _log(msg)
 
     # === Round 1: Parallel initial queries ===
-    await ctx.info("[council] Starting round 1: querying Codex and Gemini in parallel...")
+    if claude_opinion and claude_opinion.strip():
+        log(f"Claude's opinion received ({len(claude_opinion)} chars)")
+    log("Round 1: querying Codex and Gemini...")
 
     codex_task = engine.create_task(
         command="council_codex",
@@ -343,12 +357,22 @@ async def council_ask(
         context=ctx,
     )
 
-    codex_task.async_task = asyncio.create_task(engine.run_codex_exec(
-        codex_task, prompt, working_directory, enable_search=False
-    ))
-    gemini_task.async_task = asyncio.create_task(engine.run_gemini_exec(
-        gemini_task, prompt, working_directory
-    ))
+    round1_start = datetime.now()
+
+    async def run_and_notify_codex():
+        await engine.run_codex_exec(codex_task, prompt, working_directory, enable_search=False)
+        elapsed = (datetime.now() - round1_start).total_seconds()
+        status = "completed" if codex_task.status == "completed" else "failed"
+        log(f"Codex {status} ({elapsed:.1f}s)")
+
+    async def run_and_notify_gemini():
+        await engine.run_gemini_exec(gemini_task, prompt, working_directory)
+        elapsed = (datetime.now() - round1_start).total_seconds()
+        status = "completed" if gemini_task.status == "completed" else "failed"
+        log(f"Gemini {status} ({elapsed:.1f}s)")
+
+    codex_task.async_task = asyncio.create_task(run_and_notify_codex())
+    gemini_task.async_task = asyncio.create_task(run_and_notify_gemini())
 
     await asyncio.gather(
         asyncio.wait_for(asyncio.shield(codex_task.async_task), timeout=timeout),
@@ -356,7 +380,8 @@ async def council_ask(
         return_exceptions=True
     )
 
-    await ctx.info("[council] Round 1 complete.")
+    round1_elapsed = (datetime.now() - round1_start).total_seconds()
+    log(f"Round 1 complete ({round1_elapsed:.1f}s)")
 
     round_1 = CouncilRound(
         codex=build_agent_response(codex_task, "codex"),
@@ -367,7 +392,7 @@ async def council_ask(
 
     # === Round 2: Deliberation (optional) ===
     if deliberate:
-        await ctx.info("[council] Starting round 2: deliberation phase...")
+        log("Round 2: deliberation phase...")
 
         codex_content = round_1.codex.content or round_1.codex.error or "(no response)"
         gemini_content = round_1.gemini.content or round_1.gemini.error or "(no response)"
@@ -408,12 +433,20 @@ async def council_ask(
             context=ctx,
         )
 
-        codex_delib_task.async_task = asyncio.create_task(engine.run_codex_exec(
-            codex_delib_task, deliberation_prompt, working_directory, enable_search=False
-        ))
-        gemini_delib_task.async_task = asyncio.create_task(engine.run_gemini_exec(
-            gemini_delib_task, deliberation_prompt, working_directory
-        ))
+        round2_start = datetime.now()
+
+        async def run_and_notify_codex_delib():
+            await engine.run_codex_exec(codex_delib_task, deliberation_prompt, working_directory, enable_search=False)
+            elapsed = (datetime.now() - round2_start).total_seconds()
+            log(f"Codex revised ({elapsed:.1f}s)")
+
+        async def run_and_notify_gemini_delib():
+            await engine.run_gemini_exec(gemini_delib_task, deliberation_prompt, working_directory)
+            elapsed = (datetime.now() - round2_start).total_seconds()
+            log(f"Gemini revised ({elapsed:.1f}s)")
+
+        codex_delib_task.async_task = asyncio.create_task(run_and_notify_codex_delib())
+        gemini_delib_task.async_task = asyncio.create_task(run_and_notify_gemini_delib())
 
         await asyncio.gather(
             asyncio.wait_for(asyncio.shield(codex_delib_task.async_task), timeout=timeout),
@@ -421,7 +454,8 @@ async def council_ask(
             return_exceptions=True
         )
 
-        await ctx.info("[council] Round 2 complete.")
+        round2_elapsed = (datetime.now() - round2_start).total_seconds()
+        log(f"Round 2 complete ({round2_elapsed:.1f}s)")
 
         round_2 = CouncilRound(
             codex=build_agent_response(codex_delib_task, "codex"),
@@ -446,6 +480,7 @@ async def council_ask(
         metadata=CouncilMetadata(
             total_duration_seconds=(datetime.now() - council_start).total_seconds(),
             rounds=2 if deliberate else 1,
+            log=log_entries,
         ),
     )
 
