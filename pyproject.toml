@@ -13,7 +13,6 @@ keywords = ["mcp", "claude", "codex", "gemini", "ai", "llm", "model-context-prot
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -26,3 +25,7 @@ dependencies = [
 
 [project.scripts]
 owlex-server = "owlex.server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["owlex*"]

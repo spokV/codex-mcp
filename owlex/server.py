@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -22,8 +23,11 @@ BYPASS_APPROVALS = os.environ.get("CODEX_BYPASS_APPROVALS", "false").lower() == 
 CLEAN_OUTPUT = os.environ.get("CODEX_CLEAN_OUTPUT", "true").lower() == "true"
 
 # Configuration - Gemini
-GEMINI_YOLO_MODE = os.environ.get("GEMINI_YOLO_MODE", "true").lower() == "true"
+# YOLO mode: false = read-only (safe), true = full access (can write/execute)
+GEMINI_YOLO_MODE = os.environ.get("GEMINI_YOLO_MODE", "false").lower() == "true"
 GEMINI_CLEAN_OUTPUT = os.environ.get("GEMINI_CLEAN_OUTPUT", "true").lower() == "true"
+
+DEFAULT_TIMEOUT = 300
 
 
 @dataclass
@@ -105,208 +109,6 @@ def clean_codex_output(raw_output: str, original_prompt: str = "") -> str:
     return cleaned.strip()
 
 
-async def _run_codex_resume(
-    task_id: str,
-    session_ref: str,
-    prompt: str,
-    working_directory: str | None = None,
-    enable_search: bool = False
-):
-    """Background coroutine that runs Codex resume and updates task status"""
-    task = tasks[task_id]
-
-    try:
-        task.status = "running"
-
-        # Build command: codex exec [options] resume [--last | session-id] -
-        full_command = ["codex", "exec", "--skip-git-repo-check"]
-
-        # Add --cd and --search before subcommand
-        if working_directory:
-            full_command.extend(["--cd", working_directory])
-        if enable_search:
-            full_command.append("--search")
-
-        if BYPASS_APPROVALS:
-            full_command.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
-            full_command.append("--full-auto")
-
-        # Add resume subcommand
-        full_command.append("resume")
-        if session_ref == "--last":
-            full_command.append("--last")
-        else:
-            full_command.append(session_ref)
-        full_command.append("-")  # Read prompt from stdin
-
-        stdin_input = prompt.encode('utf-8')
-
-        process = await asyncio.create_subprocess_exec(
-            *full_command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        task.process = process
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=stdin_input),
-                timeout=300
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            task.status = "failed"
-            task.error = "Codex resume timed out after 300 seconds"
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-            return
-
-        stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
-        stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
-
-        if process.returncode == 0:
-            cleaned_output = clean_codex_output(stdout_text, prompt)
-            task.result = f"Codex Resume Output:\n\n{cleaned_output}"
-            task.status = "completed"
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-        else:
-            error_output = []
-            if stdout_text.strip():
-                error_output.append(f"stdout:\n{stdout_text}")
-            if stderr_text.strip():
-                error_output.append(f"stderr:\n{stderr_text}")
-            task.status = "failed"
-            task.error = f"Codex resume failed (exit code {process.returncode}):\n\n" + ("\n\n".join(error_output) or "No output")
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-
-    except asyncio.CancelledError:
-        task.status = "cancelled"
-        task.completion_time = datetime.now()
-        if task.process:
-            try:
-                task.process.kill()
-                await task.process.wait()
-            except:
-                pass
-        await _emit_task_notification(task)
-        raise
-
-    except FileNotFoundError as e:
-        task.error = "Error: 'codex' command not found. Please ensure Codex CLI is installed and in your PATH." if e.filename == "codex" else f"Error: {e}"
-        task.status = "failed"
-        task.completion_time = datetime.now()
-        await _emit_task_notification(task)
-
-    except Exception as e:
-        task.status = "failed"
-        task.error = f"Error executing Codex resume: {str(e)}"
-        task.completion_time = datetime.now()
-        await _emit_task_notification(task)
-
-
-async def _run_codex_exec(
-    task_id: str,
-    prompt: str,
-    working_directory: str | None = None,
-    enable_search: bool = False
-):
-    """Background coroutine that runs Codex exec (new session) and updates task status"""
-    task = tasks[task_id]
-
-    try:
-        task.status = "running"
-
-        # Build command: codex exec [options] -
-        full_command = ["codex", "exec", "--skip-git-repo-check"]
-
-        if working_directory:
-            full_command.extend(["--cd", working_directory])
-        if enable_search:
-            full_command.append("--search")
-
-        if BYPASS_APPROVALS:
-            full_command.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
-            full_command.append("--full-auto")
-
-        full_command.append("-")  # Read prompt from stdin
-
-        stdin_input = prompt.encode('utf-8')
-
-        process = await asyncio.create_subprocess_exec(
-            *full_command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-
-        task.process = process
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(input=stdin_input),
-                timeout=300
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            task.status = "failed"
-            task.error = "Codex exec timed out after 300 seconds"
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-            return
-
-        stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
-        stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
-
-        if process.returncode == 0:
-            cleaned_output = clean_codex_output(stdout_text, prompt)
-            task.result = f"Codex Output:\n\n{cleaned_output}"
-            task.status = "completed"
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-        else:
-            error_output = []
-            if stdout_text.strip():
-                error_output.append(f"stdout:\n{stdout_text}")
-            if stderr_text.strip():
-                error_output.append(f"stderr:\n{stderr_text}")
-            task.status = "failed"
-            task.error = f"Codex exec failed (exit code {process.returncode}):\n\n" + ("\n\n".join(error_output) or "No output")
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-
-    except asyncio.CancelledError:
-        task.status = "cancelled"
-        task.completion_time = datetime.now()
-        if task.process:
-            try:
-                task.process.kill()
-                await task.process.wait()
-            except:
-                pass
-        await _emit_task_notification(task)
-        raise
-
-    except FileNotFoundError as e:
-        task.error = "Error: 'codex' command not found. Please ensure Codex CLI is installed and in your PATH." if e.filename == "codex" else f"Error: {e}"
-        task.status = "failed"
-        task.completion_time = datetime.now()
-        await _emit_task_notification(task)
-
-    except Exception as e:
-        task.status = "failed"
-        task.error = f"Error executing Codex: {str(e)}"
-        task.completion_time = datetime.now()
-        await _emit_task_notification(task)
-
-
 def clean_gemini_output(raw_output: str, original_prompt: str = "") -> str:
     """Clean Gemini CLI output by removing noise."""
     if not GEMINI_CLEAN_OUTPUT:
@@ -326,48 +128,46 @@ def clean_gemini_output(raw_output: str, original_prompt: str = "") -> str:
     return cleaned.strip()
 
 
-async def _run_gemini_exec(
+async def _run_command_task(
     task_id: str,
+    command: list[str],
     prompt: str,
-    working_directory: str | None = None,
+    output_cleaner: Callable[[str, str], str],
+    output_prefix: str,
+    cwd: str | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    not_found_hint: str | None = None,
 ):
-    """Background coroutine that runs Gemini CLI (new session) and updates task status"""
+    """
+    Generic helper to run a subprocess command for a task.
+    Handles process creation, timeouts, output cleaning, and status updates.
+    """
     task = tasks[task_id]
-
+    
     try:
         task.status = "running"
-
-        # Build command: gemini [options] "prompt"
-        full_command = ["gemini"]
-
-        if GEMINI_YOLO_MODE:
-            full_command.extend(["--approval-mode", "yolo"])
-
-        if working_directory:
-            full_command.extend(["--include-directories", working_directory])
-
-        full_command.append(prompt)
+        stdin_input = prompt.encode('utf-8')
 
         process = await asyncio.create_subprocess_exec(
-            *full_command,
+            *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=working_directory
+            cwd=cwd
         )
 
         task.process = process
 
         try:
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=300
+                process.communicate(input=stdin_input),
+                timeout=timeout
             )
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
             task.status = "failed"
-            task.error = "Gemini exec timed out after 300 seconds"
+            task.error = f"{command[0]} command timed out after {timeout} seconds"
             task.completion_time = datetime.now()
             await _emit_task_notification(task)
             return
@@ -376,8 +176,8 @@ async def _run_gemini_exec(
         stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
 
         if process.returncode == 0:
-            cleaned_output = clean_gemini_output(stdout_text, prompt)
-            task.result = f"Gemini Output:\n\n{cleaned_output}"
+            cleaned_output = output_cleaner(stdout_text, prompt)
+            task.result = f"{output_prefix}:\n\n{cleaned_output}"
             task.status = "completed"
             task.completion_time = datetime.now()
             await _emit_task_notification(task)
@@ -388,7 +188,7 @@ async def _run_gemini_exec(
             if stderr_text.strip():
                 error_output.append(f"stderr:\n{stderr_text}")
             task.status = "failed"
-            task.error = f"Gemini exec failed (exit code {process.returncode}):\n\n" + ("\n\n".join(error_output) or "No output")
+            task.error = f"{command[0]} failed (exit code {process.returncode}):\n\n" + ("\n\n".join(error_output) or "No output")
             task.completion_time = datetime.now()
             await _emit_task_notification(task)
 
@@ -405,16 +205,121 @@ async def _run_gemini_exec(
         raise
 
     except FileNotFoundError as e:
-        task.error = "Error: 'gemini' command not found. Please ensure Gemini CLI is installed (brew install gemini-cli)." if e.filename == "gemini" else f"Error: {e}"
+        cmd_name = command[0]
+        if e.filename == cmd_name:
+            hint = not_found_hint or "Please ensure it is installed and in your PATH."
+            task.error = f"Error: '{cmd_name}' command not found. {hint}"
+        else:
+            task.error = f"Error: {e}"
         task.status = "failed"
         task.completion_time = datetime.now()
         await _emit_task_notification(task)
 
     except Exception as e:
         task.status = "failed"
-        task.error = f"Error executing Gemini: {str(e)}"
+        task.error = f"Error executing {command[0]}: {str(e)}"
         task.completion_time = datetime.now()
         await _emit_task_notification(task)
+
+
+async def _run_codex_resume(
+    task_id: str,
+    session_ref: str,
+    prompt: str,
+    working_directory: str | None = None,
+    enable_search: bool = False
+):
+    """Background coroutine that runs Codex resume and updates task status"""
+    # Build command: codex exec [options] resume [--last | session-id] -
+    full_command = ["codex", "exec", "--skip-git-repo-check"]
+
+    # Add --cd and --search before subcommand
+    if working_directory:
+        full_command.extend(["--cd", working_directory])
+    if enable_search:
+        full_command.append("--search")
+
+    if BYPASS_APPROVALS:
+        full_command.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        full_command.append("--full-auto")
+
+    # Add resume subcommand
+    full_command.append("resume")
+    if session_ref == "--last":
+        full_command.append("--last")
+    else:
+        full_command.append(session_ref)
+    full_command.append("-")  # Read prompt from stdin
+
+    await _run_command_task(
+        task_id=task_id,
+        command=full_command,
+        prompt=prompt,
+        output_cleaner=clean_codex_output,
+        output_prefix="Codex Resume Output",
+        not_found_hint="Please ensure Codex CLI is installed and in your PATH.",
+    )
+
+
+async def _run_codex_exec(
+    task_id: str,
+    prompt: str,
+    working_directory: str | None = None,
+    enable_search: bool = False
+):
+    """Background coroutine that runs Codex exec (new session) and updates task status"""
+    # Build command: codex exec [options] -
+    full_command = ["codex", "exec", "--skip-git-repo-check"]
+
+    if working_directory:
+        full_command.extend(["--cd", working_directory])
+    if enable_search:
+        full_command.append("--search")
+
+    if BYPASS_APPROVALS:
+        full_command.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        full_command.append("--full-auto")
+
+    full_command.append("-")  # Read prompt from stdin
+
+    await _run_command_task(
+        task_id=task_id,
+        command=full_command,
+        prompt=prompt,
+        output_cleaner=clean_codex_output,
+        output_prefix="Codex Output",
+        not_found_hint="Please ensure Codex CLI is installed and in your PATH.",
+    )
+
+
+async def _run_gemini_exec(
+    task_id: str,
+    prompt: str,
+    working_directory: str | None = None,
+):
+    """Background coroutine that runs Gemini CLI (new session) and updates task status"""
+    # Build command: gemini [options] "prompt"
+    full_command = ["gemini"]
+
+    if GEMINI_YOLO_MODE:
+        full_command.extend(["--approval-mode", "yolo"])
+
+    if working_directory:
+        full_command.extend(["--include-directories", working_directory])
+
+    full_command.append(prompt)  # Gemini takes prompt as argument, not stdin
+
+    await _run_command_task(
+        task_id=task_id,
+        command=full_command,
+        prompt="",
+        output_cleaner=clean_gemini_output,
+        output_prefix="Gemini Output",
+        cwd=working_directory,
+        not_found_hint="Please ensure Gemini CLI is installed (npm install -g @google/gemini-cli).",
+    )
 
 
 async def _run_gemini_resume(
@@ -424,91 +329,28 @@ async def _run_gemini_resume(
     working_directory: str | None = None,
 ):
     """Background coroutine that runs Gemini resume and updates task status"""
-    task = tasks[task_id]
+    # Build command: gemini [options] -r <session> "prompt"
+    full_command = ["gemini"]
 
-    try:
-        task.status = "running"
+    if GEMINI_YOLO_MODE:
+        full_command.extend(["--approval-mode", "yolo"])
 
-        # Build command: gemini [options] -r <session> "prompt"
-        full_command = ["gemini"]
+    if working_directory:
+        full_command.extend(["--include-directories", working_directory])
 
-        if GEMINI_YOLO_MODE:
-            full_command.extend(["--approval-mode", "yolo"])
+    # Add resume flag
+    full_command.extend(["-r", session_ref])
+    full_command.append(prompt)
 
-        if working_directory:
-            full_command.extend(["--include-directories", working_directory])
-
-        # Add resume flag
-        full_command.extend(["-r", session_ref])
-        full_command.append(prompt)
-
-        process = await asyncio.create_subprocess_exec(
-            *full_command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=working_directory
-        )
-
-        task.process = process
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=300
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            task.status = "failed"
-            task.error = "Gemini resume timed out after 300 seconds"
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-            return
-
-        stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
-        stderr_text = stderr.decode('utf-8', errors='replace') if stderr else ""
-
-        if process.returncode == 0:
-            cleaned_output = clean_gemini_output(stdout_text, prompt)
-            task.result = f"Gemini Resume Output:\n\n{cleaned_output}"
-            task.status = "completed"
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-        else:
-            error_output = []
-            if stdout_text.strip():
-                error_output.append(f"stdout:\n{stdout_text}")
-            if stderr_text.strip():
-                error_output.append(f"stderr:\n{stderr_text}")
-            task.status = "failed"
-            task.error = f"Gemini resume failed (exit code {process.returncode}):\n\n" + ("\n\n".join(error_output) or "No output")
-            task.completion_time = datetime.now()
-            await _emit_task_notification(task)
-
-    except asyncio.CancelledError:
-        task.status = "cancelled"
-        task.completion_time = datetime.now()
-        if task.process:
-            try:
-                task.process.kill()
-                await task.process.wait()
-            except:
-                pass
-        await _emit_task_notification(task)
-        raise
-
-    except FileNotFoundError as e:
-        task.error = "Error: 'gemini' command not found. Please ensure Gemini CLI is installed (brew install gemini-cli)." if e.filename == "gemini" else f"Error: {e}"
-        task.status = "failed"
-        task.completion_time = datetime.now()
-        await _emit_task_notification(task)
-
-    except Exception as e:
-        task.status = "failed"
-        task.error = f"Error executing Gemini resume: {str(e)}"
-        task.completion_time = datetime.now()
-        await _emit_task_notification(task)
+    await _run_command_task(
+        task_id=task_id,
+        command=full_command,
+        prompt="",
+        output_cleaner=clean_gemini_output,
+        output_prefix="Gemini Resume Output",
+        cwd=working_directory,
+        not_found_hint="Please ensure Gemini CLI is installed (npm install -g @google/gemini-cli).",
+    )
 
 
 @mcp.tool()
@@ -703,7 +545,7 @@ async def get_task_result(task_id: str) -> str:
 
 
 @mcp.tool()
-async def wait_for_task(task_id: str, timeout: int = 300) -> str:
+async def wait_for_task(task_id: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     """
     Wait for a task to complete and return its result.
 
