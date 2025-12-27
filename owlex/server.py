@@ -15,6 +15,7 @@ from mcp.server.session import ServerSession
 
 from .models import (
     TaskResponse,
+    ClaudeOpinion,
     CouncilResponse,
     CouncilRound,
     CouncilMetadata,
@@ -301,6 +302,7 @@ async def wait_for_task(task_id: str, timeout: int = DEFAULT_TIMEOUT) -> str:
 async def council_ask(
     ctx: Context[ServerSession, None],
     prompt: str = Field(description="The question or task to send to the council"),
+    claude_opinion: str | None = Field(default=None, description="Claude's initial opinion to share with the council"),
     working_directory: str | None = Field(default=None, description="Working directory for context"),
     deliberate: bool = Field(default=True, description="If true, share answers between agents for a second round of deliberation"),
     timeout: int = Field(default=DEFAULT_TIMEOUT, description="Timeout per agent in seconds"),
@@ -311,8 +313,11 @@ async def council_ask(
     Sends the prompt to both Codex and Gemini in parallel, waits for responses,
     and returns all answers for the MCP client (Claude Code) to synthesize.
 
-    If deliberate=True, shares all initial answers with each agent for a second
-    round, allowing them to revise their opinions after seeing others' responses.
+    If claude_opinion is provided, it will be shared with other council members
+    during deliberation so they can consider Claude's perspective.
+
+    If deliberate=True, shares all answers (including Claude's) with each agent
+    for a second round, allowing them to revise after seeing others' responses.
     """
     if not prompt or not prompt.strip():
         return json.dumps({"error": "'prompt' parameter is required."})
@@ -366,19 +371,31 @@ async def council_ask(
 
         codex_content = round_1.codex.content or round_1.codex.error or "(no response)"
         gemini_content = round_1.gemini.content or round_1.gemini.error or "(no response)"
+        claude_content = claude_opinion.strip() if claude_opinion else None
 
-        deliberation_prompt = f"""You previously answered a question. Now review all council members' answers and provide your revised opinion.
+        # Build deliberation prompt with all available opinions
+        deliberation_parts = [
+            "You previously answered a question. Now review all council members' answers and provide your revised opinion.",
+            "",
+            "ORIGINAL QUESTION:",
+            prompt,
+        ]
 
-ORIGINAL QUESTION:
-{prompt}
+        if claude_content:
+            deliberation_parts.extend(["", "CLAUDE'S ANSWER:", claude_content])
 
-CODEX'S ANSWER:
-{codex_content}
+        deliberation_parts.extend([
+            "",
+            "CODEX'S ANSWER:",
+            codex_content,
+            "",
+            "GEMINI'S ANSWER:",
+            gemini_content,
+            "",
+            "Please provide your revised answer after considering the other perspectives. Note any points of agreement or disagreement.",
+        ])
 
-GEMINI'S ANSWER:
-{gemini_content}
-
-Please provide your revised answer after considering the other perspectives. Note any points of agreement or disagreement."""
+        deliberation_prompt = "\n".join(deliberation_parts)
 
         codex_delib_task = engine.create_task(
             command="council_codex_delib",
@@ -411,10 +428,19 @@ Please provide your revised answer after considering the other perspectives. Not
             gemini=build_agent_response(gemini_delib_task, "gemini"),
         )
 
+    # Build Claude opinion object if provided
+    claude_opinion_obj = None
+    if claude_opinion and claude_opinion.strip():
+        claude_opinion_obj = ClaudeOpinion(
+            content=claude_opinion.strip(),
+            provided_at=council_start.isoformat(),
+        )
+
     response = CouncilResponse(
         prompt=prompt,
         working_directory=working_directory,
         deliberation=deliberate,
+        claude_opinion=claude_opinion_obj,
         round_1=round_1,
         round_2=round_2,
         metadata=CouncilMetadata(

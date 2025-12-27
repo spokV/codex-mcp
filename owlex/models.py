@@ -75,6 +75,12 @@ class AgentResponse(BaseModel):
     task_id: str
 
 
+class ClaudeOpinion(BaseModel):
+    """Claude's initial opinion provided before council deliberation."""
+    content: str
+    provided_at: str  # ISO timestamp
+
+
 class CouncilRound(BaseModel):
     """A single round of council deliberation."""
     codex: AgentResponse
@@ -92,6 +98,7 @@ class CouncilResponse(BaseModel):
     prompt: str
     working_directory: str | None = None
     deliberation: bool
+    claude_opinion: ClaudeOpinion | None = None
     round_1: CouncilRound
     round_2: CouncilRound | None = None
     metadata: CouncilMetadata
