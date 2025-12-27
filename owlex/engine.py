@@ -232,12 +232,12 @@ class TaskEngine:
 
             task.process = process
 
-            if prompt:
-                process.stdin.write(prompt.encode('utf-8'))
-                await process.stdin.drain()
-            process.stdin.close()
-
             if stream:
+                # Streaming mode: manually write stdin, then read line-by-line
+                if prompt:
+                    process.stdin.write(prompt.encode('utf-8'))
+                    await process.stdin.drain()
+                process.stdin.close()
                 try:
                     async def read_with_timeout():
                         stdout_task = asyncio.create_task(
@@ -264,6 +264,7 @@ class TaskEngine:
                     await self._emit_task_notification(task)
                     return
             else:
+                # Non-streaming mode: use communicate() which handles stdin internally
                 try:
                     stdout, stderr = await asyncio.wait_for(
                         process.communicate(input=prompt.encode('utf-8') if prompt else None),

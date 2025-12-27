@@ -47,6 +47,47 @@ def _validate_working_directory(working_directory: str | None) -> tuple[str | No
     return expanded, None
 
 
+async def _kill_task_subprocess(task):
+    """Kill subprocess for a task if it's still running."""
+    if task.process and task.process.returncode is None:
+        try:
+            task.process.kill()
+            await task.process.wait()
+        except Exception:
+            pass
+    if task.async_task and not task.async_task.done():
+        task.async_task.cancel()
+        try:
+            await task.async_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _run_council_tasks(tasks: list, timeout: int, log_func) -> list[Exception | None]:
+    """
+    Run council tasks with proper timeout handling and cleanup.
+    Returns list of exceptions (or None for successful tasks).
+    """
+    results = await asyncio.gather(
+        *[t.async_task for t in tasks],
+        return_exceptions=True
+    )
+
+    # Check for timeouts and cleanup any still-running processes
+    for i, (task, result) in enumerate(zip(tasks, results)):
+        if isinstance(result, asyncio.TimeoutError):
+            log_func(f"{task.command} timed out after {timeout}s")
+            await _kill_task_subprocess(task)
+            task.status = "failed"
+            task.error = f"Timed out after {timeout} seconds"
+            task.completion_time = datetime.now()
+        elif isinstance(result, Exception):
+            log_func(f"{task.command} failed: {result}")
+            await _kill_task_subprocess(task)
+
+    return results
+
+
 # === Codex Tools ===
 
 @mcp.tool()
@@ -302,6 +343,73 @@ async def wait_for_task(task_id: str, timeout: int = DEFAULT_TIMEOUT) -> str:
     ).model_dump_json()
 
 
+@mcp.tool()
+async def list_tasks(
+    status_filter: str | None = Field(default=None, description="Filter by status: pending, running, completed, failed, cancelled"),
+    limit: int = Field(default=20, description="Maximum number of tasks to return"),
+) -> str:
+    """
+    List all tracked tasks with their current status.
+
+    Args:
+        status_filter: Optional filter by task status
+        limit: Maximum number of tasks to return (default: 20)
+    """
+    tasks_list = []
+    for task_id, task in list(engine.tasks.items())[-limit:]:
+        if status_filter and task.status != status_filter:
+            continue
+        elapsed = (datetime.now() - task.start_time).total_seconds()
+        tasks_list.append({
+            "task_id": task_id,
+            "command": task.command,
+            "status": task.status,
+            "elapsed_seconds": round(elapsed, 1),
+            "has_result": task.result is not None,
+            "has_error": task.error is not None,
+        })
+
+    return json.dumps({
+        "success": True,
+        "count": len(tasks_list),
+        "tasks": tasks_list,
+    }, indent=2)
+
+
+@mcp.tool()
+async def cancel_task(task_id: str) -> str:
+    """
+    Cancel a running task and kill its subprocess.
+
+    Args:
+        task_id: The task ID to cancel
+    """
+    task = engine.get_task(task_id)
+    if not task:
+        return TaskResponse(success=False, error=f"Task '{task_id}' not found.").model_dump_json()
+
+    if task.status in ["completed", "failed", "cancelled"]:
+        return TaskResponse(
+            success=False,
+            task_id=task_id,
+            status=task.status,
+            error=f"Task already {task.status}, cannot cancel.",
+        ).model_dump_json()
+
+    # Kill the subprocess and cancel the async task
+    await _kill_task_subprocess(task)
+    task.status = "cancelled"
+    task.error = "Cancelled by user"
+    task.completion_time = datetime.now()
+
+    return TaskResponse(
+        success=True,
+        task_id=task_id,
+        status=task.status,
+        message="Task cancelled successfully.",
+    ).model_dump_json()
+
+
 # === Council Tool ===
 
 @mcp.tool()
@@ -374,11 +482,21 @@ async def council_ask(
     codex_task.async_task = asyncio.create_task(run_and_notify_codex())
     gemini_task.async_task = asyncio.create_task(run_and_notify_gemini())
 
-    await asyncio.gather(
-        asyncio.wait_for(asyncio.shield(codex_task.async_task), timeout=timeout),
-        asyncio.wait_for(asyncio.shield(gemini_task.async_task), timeout=timeout),
-        return_exceptions=True
+    # Wait for both tasks with timeout, then cleanup any that didn't complete
+    done, pending = await asyncio.wait(
+        [codex_task.async_task, gemini_task.async_task],
+        timeout=timeout,
+        return_when=asyncio.ALL_COMPLETED
     )
+
+    # Kill subprocesses for any tasks that timed out
+    for task in [codex_task, gemini_task]:
+        if task.async_task in pending:
+            log(f"{task.command} timed out")
+            await _kill_task_subprocess(task)
+            task.status = "failed"
+            task.error = f"Timed out after {timeout} seconds"
+            task.completion_time = datetime.now()
 
     round1_elapsed = (datetime.now() - round1_start).total_seconds()
     log(f"Round 1 complete ({round1_elapsed:.1f}s)")
@@ -448,11 +566,21 @@ async def council_ask(
         codex_delib_task.async_task = asyncio.create_task(run_and_notify_codex_delib())
         gemini_delib_task.async_task = asyncio.create_task(run_and_notify_gemini_delib())
 
-        await asyncio.gather(
-            asyncio.wait_for(asyncio.shield(codex_delib_task.async_task), timeout=timeout),
-            asyncio.wait_for(asyncio.shield(gemini_delib_task.async_task), timeout=timeout),
-            return_exceptions=True
+        # Wait for both tasks with timeout, then cleanup any that didn't complete
+        done, pending = await asyncio.wait(
+            [codex_delib_task.async_task, gemini_delib_task.async_task],
+            timeout=timeout,
+            return_when=asyncio.ALL_COMPLETED
         )
+
+        # Kill subprocesses for any tasks that timed out
+        for task in [codex_delib_task, gemini_delib_task]:
+            if task.async_task in pending:
+                log(f"{task.command} timed out")
+                await _kill_task_subprocess(task)
+                task.status = "failed"
+                task.error = f"Timed out after {timeout} seconds"
+                task.completion_time = datetime.now()
 
         round2_elapsed = (datetime.now() - round2_start).total_seconds()
         log(f"Round 2 complete ({round2_elapsed:.1f}s)")

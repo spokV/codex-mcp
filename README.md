@@ -115,6 +115,43 @@ Get the result of a task (Codex or Gemini) without blocking.
 |-----------|----------|-------------|
 | `task_id` | Yes | Task ID returned by session tools |
 
+#### `list_tasks`
+
+List all tracked tasks with their current status.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `status_filter` | No | Filter by status: pending, running, completed, failed, cancelled |
+| `limit` | No | Maximum number of tasks to return (default: 20) |
+
+#### `cancel_task`
+
+Cancel a running task and kill its subprocess.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `task_id` | Yes | Task ID to cancel |
+
+### Council Tool
+
+#### `council_ask`
+
+Ask the council (Codex + Gemini) a question and collect their answers. Runs both agents in parallel, optionally with a deliberation round where each agent can revise their answer after seeing all perspectives.
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `prompt` | Yes | Question or task to send to the council |
+| `claude_opinion` | No | Claude's initial opinion to share with the council |
+| `working_directory` | No | Working directory for context |
+| `deliberate` | No | If true, share answers for a second round (default: true) |
+| `timeout` | No | Timeout per agent in seconds (default: 300) |
+
+**Response includes:**
+- `claude_opinion`: Claude's opinion if provided
+- `round_1`: Initial answers from Codex and Gemini
+- `round_2`: Revised answers after deliberation (if enabled)
+- `metadata.log`: Progress timeline (e.g., "Codex completed (3.2s)")
+
 ## Environment Variables
 
 ### Codex Settings
@@ -122,5 +159,5 @@ Get the result of a task (Codex or Gemini) without blocking.
 - `CODEX_BYPASS_APPROVALS`: Bypass sandbox mode (default: `false`)
 
 ### Gemini Settings
-- `GEMINI_YOLO_MODE`: Auto-approve actions via `--approval-mode yolo` (default: `true`)
+- `GEMINI_YOLO_MODE`: Auto-approve actions via `--approval-mode yolo` (default: `false` - read-only mode)
 - `GEMINI_CLEAN_OUTPUT`: Remove noise from output (default: `true`)
